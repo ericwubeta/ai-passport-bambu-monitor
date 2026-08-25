@@ -16,7 +16,7 @@ static const char *TAG = "demo_audio";
 #define SAMPLE_RATE   16000
 #define TONE_HZ        1000
 #define TONE_MS        1000
-#define RECORD_SEC        3
+#define RECORD_SEC        1          // 1s @16k 16bit = 32KB(C3 堆紧张,失败自动降级 0.5s)
 #define CHUNK_SAMPLES   512          // 每次收发的采样数,控制临时缓冲大小
 
 static lv_obj_t *s_scr, *s_status, *s_mascot;
@@ -57,17 +57,22 @@ static void play_tone(void) {
 static void record_and_play(void) {
     if (bsp_audio_set_format(SAMPLE_RATE, 16, 1) != ESP_OK) { set_status("format failed"); return; }
 
-    size_t total = (size_t)SAMPLE_RATE * RECORD_SEC;
-    int16_t *rec = malloc(total * sizeof(int16_t));   // 3s @16k 16bit = 96KB
+    size_t total = (size_t)SAMPLE_RATE * RECORD_SEC;   // 1s = 32KB
+    int16_t *rec = malloc(total * sizeof(int16_t));
     if (!rec) {
-        // C3 无 PSRAM,96KB 可能分配不到 —— 明确告知而不是静默失败
-        ESP_LOGE(TAG, "录音缓冲 %u 字节分配失败(C3 内存紧张,可缩短 RECORD_SEC)",
-                 (unsigned)(total * sizeof(int16_t)));
-        set_status("record buffer alloc failed");
-        return;
+        // C3 无 PSRAM,堆紧张:自动降级到 0.5s(16KB)再试,仍失败才明确提示
+        total = (size_t)SAMPLE_RATE * RECORD_SEC / 2;
+        rec = malloc(total * sizeof(int16_t));
+        if (!rec) {
+            ESP_LOGE(TAG, "录音缓冲分配失败(C3 堆不足)");
+            set_status("out of memory, record failed");
+            return;
+        }
+        set_status("recording 0.5s...");
+    } else {
+        set_status("recording 1s...");
     }
 
-    set_status("recording 3s... speak now");
     size_t got = 0;
     while (got < total) {
         size_t n = (total - got) < CHUNK_SAMPLES ? (total - got) : CHUNK_SAMPLES;

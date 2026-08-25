@@ -1,9 +1,10 @@
-// main/main.c —— FoloToy-Card BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
+// main/main.c —— AI 通行证固件入口:开机动画 → 打印机监控主界面;
+// 长按确定回到演示菜单(原 BSP 参考示例保留)。
 //
 // 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
+//   上/下 短按   菜单中=移动选中项;打印机页=切换页面
+//   确定  短按   菜单中=进入选中项;打印机页=立即刷新
+//   确定  长按   任意页面=返回菜单
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "bsp_button.h"
@@ -12,16 +13,24 @@
 #include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
 #include "demo.h"
 #include "ui_pixel.h"
+#include "app_boot.h"
+#include "app_printer.h"
+#include "app_wifi.h"
+#include "app_mqtt.h"
+#include "font_zh.h"
 #include "lvgl.h"
 #include "esp_log.h"
 
 static const char *TAG = "main";
 
+// 打印机页作为第 0 项进入主流程;下面 4 项是原 BSP 演示。
 static const demo_entry_t DEMOS[] = {
-    { "Display", demo_display_enter, demo_display_exit, demo_display_key },
-    { "Button",  demo_button_enter,  demo_button_exit,  demo_button_key  },
-    { "Audio",   demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
-    { "Battery", demo_battery_enter, demo_battery_exit, demo_battery_key },
+    { "打印机", app_printer_enter, app_printer_exit, app_printer_key },
+    { "显示",   demo_display_enter, demo_display_exit, demo_display_key },
+    { "按键",   demo_button_enter,  demo_button_exit,  demo_button_key  },
+    { "音频",   demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
+    { "电量",   demo_battery_enter, demo_battery_exit, demo_battery_key },
+    { "酒桌游戏", demo_party_enter, demo_party_exit, demo_party_key },
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
@@ -33,7 +42,8 @@ static lv_obj_t *s_cards[DEMO_COUNT];
 static lv_obj_t *s_rows[DEMO_COUNT];
 static lv_obj_t *s_mascot;
 static int  s_sel;                 // 当前选中项
-static int  s_active = -1;         // 当前所在演示页;-1 = 在菜单
+static int  s_active = -1;         // 当前所在页面;-1 = 在菜单
+static bool s_in_printer = false;  // 主流程开机后直接进打印机页(不是经菜单进入)
 
 static void menu_refresh(void) {
     for (size_t i = 0; i < DEMO_COUNT; i++) {
@@ -47,19 +57,20 @@ static void menu_refresh(void) {
 }
 
 static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
+    s_menu_scr = ui_pixel_screen_create("AI 通行证");
 
+    // 5 张卡片:2 列 3 行紧凑排布,给吉祥物留出脚下草地
     for (size_t i = 0; i < DEMO_COUNT; i++) {
         int x = 11 + (int)(i % 2) * 112;
-        int y = 58 + (int)(i / 2) * 86;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 72, UI_PAPER);
+        int y = 52 + (int)(i / 2) * 64;
+        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 54, UI_PAPER);
         s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(s_rows[i], &font_zh14, 0);
         lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_center(s_rows[i]);
     }
 
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 238);
+    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 246);
 
     menu_refresh();
     lv_screen_load(s_menu_scr);
@@ -67,6 +78,7 @@ static void menu_build(void) {
 
 static void enter_menu(void) {
     s_active = -1;
+    s_in_printer = false;
     menu_build();
 }
 
@@ -87,6 +99,7 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
         if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
         if (btn == BSP_BTN_OK && s_ok[s_sel]) {
             s_active = s_sel;
+            if (s_sel == 0) s_in_printer = true;
             ui_pixel_mascot_jump(s_mascot);
             lv_obj_delete(s_menu_scr);
             s_menu_scr = NULL;
@@ -99,30 +112,39 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     bsp_lvgl_unlock();
 }
 
+// 开机动画结束回调(此时已持 LVGL 锁):起网络,进打印机主界面
+static void boot_done(void) {
+    app_wifi_start();
+    app_mqtt_start();
+    s_active = 0;
+    s_in_printer = true;
+    app_printer_enter();
+}
+
 void app_main(void) {
-    ESP_LOGI(TAG, "FoloToy-Card BSP demo 启动");
+    ESP_LOGI(TAG, "AI Passport 打印机监控固件启动");
 
     bsp_i2c_init();
     bsp_i2c_scan();
 
-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
+        ESP_LOGE(TAG, "显示/LVGL 初始化失败,固件无法继续。"
                       "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
                  BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
         return;
     }
     bsp_display_backlight(100);
 
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    s_ok[1] = (bsp_button_init(on_key, NULL) == ESP_OK);
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
+    s_ok[0] = true;                                   // Printer 页始终可用
+    s_ok[1] = true;                                   // Display 已确认可用
+    s_ok[2] = (bsp_button_init(on_key, NULL) == ESP_OK);
+    s_ok[3] = (bsp_audio_init() == ESP_OK);
+    s_ok[4] = (bsp_battery_init() == ESP_OK);
+    s_ok[5] = s_ok[2];                       // 酒桌游戏依赖按键,复用按键初始化结果
 
-    if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
+    // 开机动画(拓竹 logo)→ 直接进打印机监控页
+    if (bsp_lvgl_lock(1000)) { app_boot_show(boot_done); bsp_lvgl_unlock(); }
 
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
+    ESP_LOGI(TAG, "就绪:Button=%d Audio=%d Battery=%d",
+             s_ok[2], s_ok[3], s_ok[4]);
 }

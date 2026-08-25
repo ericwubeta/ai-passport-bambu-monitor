@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,  Size,    Flags
+# 8MB Flash:WiFi+TLS+MQTT 后固件约 1.6MB,默认单 APP 表(1MB)装不下,
+# factory 放大到 4M,余量留给 Phase 2(中文字体/HMS 码表等)。
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 4M,

@@ -4,3 +4,9 @@ sdkconfig.old
 managed_components/
 dependencies.lock
 .vscode/
+main/secrets.h
+# 构建产物 / 调试日志 / Python 缓存
+bambumonitor.bin
+build_log.txt
+__pycache__/
+*.pyc
