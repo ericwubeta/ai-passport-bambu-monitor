@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include "app_config.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -30,6 +31,13 @@ static SemaphoreHandle_t s_lock;
 static bambu_state_t s_state;
 static int64_t s_conn_since;      // 云连接建立的时间戳(us)
 static bool s_ever_data;
+
+// 凭据:NVS(配网写入)优先,空则回落 secrets.h。app_mqtt_start 时解析一次。
+static char s_uid[40];            // "u_<USER_ID>"
+static char s_tok[260];           // accessToken
+static char s_sn[34];             // 打印机序列号
+
+static const char *sn(void) { return s_sn[0] ? s_sn : CFG_BAMBU_SERIAL; }
 
 // ---------------------------------------------------------------- 工具
 
@@ -80,6 +88,20 @@ static uint32_t parse_color(const char *hex)
     if (!hex || strlen(hex) < 6) return 0;
     char buf[7] = { hex[0], hex[1], hex[2], hex[3], hex[4], hex[5], 0 };
     return (uint32_t)strtoul(buf, NULL, 16);
+}
+
+// UTF-8 安全复制截断(不会从多字节汉字中间切断)
+static void copy_utf8(const char *in, char *out, int n)
+{
+    int w = 0;
+    while (*in && w < n - 1) {
+        unsigned char c = (unsigned char)*in;
+        int clen = (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+        if (w + clen >= n) break;                // 放不下整字则截断
+        for (int i = 0; i < clen && in[i]; i++) out[w++] = in[i];
+        in += clen;
+    }
+    out[w] = 0;
 }
 
 // ---------------------------------------------------------------- 解析
@@ -205,11 +227,9 @@ static const char *jpath(const char *base, int len, const char *path, const char
         const char *val = jfind_key(obj, end, key, klen, &ve);
         if (!val) return NULL;
 
-        if (*tok == 0) { if (out_end) *out_end = ve; return val; }
-
-        if (idx >= 0) {                          // 数组元素
-            const char *p = jskip_ws(val, ve);
-            if (p >= ve || *p != '[') return NULL;
+        if (idx >= 0) {                          // 数组元素:必须先取第 idx 个元素,
+            const char *p = jskip_ws(val, ve);   // 再判断路径是否结束(否则
+            if (p >= ve || *p != '[') return NULL; // "ams.ams[0]" 会返回整个数组)
             p++;
             for (int i = 0; i < idx; i++) {
                 p = jskip_ws(p, ve);
@@ -222,24 +242,26 @@ static const char *jpath(const char *base, int len, const char *path, const char
             if (p >= ve || *p == ']') return NULL;
             val = p;
             ve = jskip_value(p, ve);
-            if (*tok == '.') tok++;
-            obj = jskip_ws(val, ve);             // 元素须为对象才能继续
-            end = ve;
-            if (obj >= end || *obj != '{') return NULL;
-            continue;
         }
 
-        obj = jskip_ws(val, ve);                 // 嵌套对象
+        if (*tok == 0) { if (out_end) *out_end = ve; return val; }
+
+        obj = jskip_ws(val, ve);                 // 嵌套对象/数组元素须为对象才能继续
         end = ve;
         if (obj >= end || *obj != '{') return NULL;
         if (*tok == '.') tok++;
     }
 }
 
-// 值区间转 int
+// 值区间转 int(兼容带引号的字符串数值,如 X2D/AMS2 的 "26.2" / "42")
 static int jint(const char *v, const char *ve, int def)
 {
     if (!v || v >= ve) return def;
+    if (*v == '"') {                             // 剥掉字符串引号,否则 atoi 见到 '"' 返回 0
+        v++;
+        if (v < ve && ve[-1] == '"') ve--;
+        if (v >= ve) return def;
+    }
     char buf[24];
     int n = (int)(ve - v);
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
@@ -279,6 +301,15 @@ static bool jstr(const char *v, const char *ve, char *out, int n)
         const char *_e = NULL; \
         const char *_v = jpath((pr), (plen), (p1), &_e); \
         if (!_v) _v = jpath((pr), (plen), (p2), &_e); \
+        if (_v) (dst) = jint(_v, _e, (dst)); \
+    } while (0)
+// 四字段名兼容(X2D 与老机型命名不同)
+#define JUPDATE_INT4(pr, plen, p1, p2, p3, p4, dst) do { \
+        const char *_e = NULL; \
+        const char *_v = jpath((pr), (plen), (p1), &_e); \
+        if (!_v) _v = jpath((pr), (plen), (p2), &_e); \
+        if (!_v) _v = jpath((pr), (plen), (p3), &_e); \
+        if (!_v) _v = jpath((pr), (plen), (p4), &_e); \
         if (_v) (dst) = jint(_v, _e, (dst)); \
     } while (0)
 
@@ -330,7 +361,10 @@ static void parse_report(const char *data, int len)
         JUPDATE_INT2(pr, plen, "nozzle_target_temper", "nozzle_target_temperature", s_state.nozzle_target);
         JUPDATE_INT2(pr, plen, "bed_temper", "bed_temperature", s_state.bed_t);
         JUPDATE_INT2(pr, plen, "bed_target_temper", "bed_target_temperature", s_state.bed_target);
-        JUPDATE_INT2(pr, plen, "chamber_temper", "chamber_temperature", s_state.chamber_t);
+        // 腔温:X2D 实测字段为 print.device.ctc.info.temp(CTC=腔温控制,藏于 device 子对象,
+        // print 一层枚举不到);老机型为 print 一层 chamber_temper,H2D 另有 ctc_info.temp
+        JUPDATE_INT4(pr, plen, "device.ctc.info.temp", "ctc_info.temp",
+                     "chamber_temper", "chamber_temperature", s_state.chamber_t);
         // 风扇:原始值 0~15,存成百分比;字段缺失时反算原值再更新,保证幂等
         {
             int fan_raw = s_state.fan_cooling_pct * 15 / 100;
@@ -350,49 +384,86 @@ static void parse_report(const char *data, int len)
         v = jpath(pr, plen, "net.info[0].ip", &ve);
         if (v) s_state.printer_ip = jint(v, ve, 0);
 
-        // ---------- AMS:遍历所有在位 AMS,每台 4 槽 ----------
+        // ---------- AMS:只在报文携带 AMS 数据时刷新 ----------
+        // 增量 push_status 报文没有 AMS 段;若无条件清零,AMS 页会在增量到达时
+        // 闪没(全量 pushall 每 30 秒才来一次),故先探测再清。
         {
+            const char *ae0 = NULL;
+            bool has_ams = jpath(pr, plen, "ams.ams[0]", &ae0) != NULL;
+            if (!has_ams) has_ams = jpath(pr, plen, "ams[0]", &ae0) != NULL;
+
+            if (has_ams) {
             int tray_now = 255;
             v = jpath(pr, plen, "ams.tray_now", &ve);
-            if (v) { char tb[8]; if (jstr(v, ve, tb, sizeof(tb))) tray_now = atoi(tb); }
+            if (v) tray_now = jint(v, ve, 255);   // jint 已兼容字符串/数字两种值
 
             memset(s_state.ams, 0, sizeof(s_state.ams));
             s_state.ams_count = 0;
             s_state.ams_active = false;
 
             for (int i = 0; i < BAMBU_AMS_MAX; i++) {
-                char path[40];
+                char path[24];
                 snprintf(path, sizeof(path), "ams.ams[%d]", i);
                 const char *ae = NULL;
                 const char *au = jpath(pr, plen, path, &ae);
+                if (!au || au >= ae) {            // 兼容 print.ams 直接是数组的固件
+                    snprintf(path, sizeof(path), "ams[%d]", i);
+                    ae = NULL;
+                    au = jpath(pr, plen, path, &ae);
+                }
                 if (!au || au >= ae) break;
                 int alen = (int)(ae - au);
 
                 bambu_ams_t *a = &s_state.ams[i];
-                v = jpath(au, alen, "humidity", &ve);  if (v) a->humidity = jint(v, ve, -1);
-                v = jpath(au, alen, "temp", &ve);      if (v) a->temp = jint(v, ve, 0);
+                v = jpath(au, alen, "humidity", &ve);     if (v) a->humidity = jint(v, ve, -1);
+                v = jpath(au, alen, "humidity_raw", &ve); if (v) a->humidity_raw = jint(v, ve, 0);
+                v = jpath(au, alen, "temp", &ve);         if (v) a->temp = jint(v, ve, 0);
 
                 int used_slots = 0;
                 for (int t = 0; t < BAMBU_TRAY_MAX; t++) {
-                    char tp[56];
-                    snprintf(tp, sizeof(tp), "ams.ams[%d].tray[%d]", i, t);
+                    char tp[16];
+                    snprintf(tp, sizeof(tp), "tray[%d]", t);
                     const char *te = NULL;
-                    const char *tr = jpath(pr, plen, tp, &te);
+                    const char *tr = jpath(au, alen, tp, &te);
                     if (!tr || tr >= te) break;
                     int tlen = (int)(te - tr);
 
                     bambu_tray_t *slot = &a->tray[t];
-                    char type[8], color[8];
+                    char type[8], color[12], name[32];
                     v = jpath(tr, tlen, "tray_type", &ve);
                     if (v && jstr(v, ve, type, sizeof(type)))
                         strlcpy(slot->tray_type, type, sizeof(slot->tray_type));
                     v = jpath(tr, tlen, "tray_color", &ve);
-                    if (v && jstr(v, ve, color, sizeof(color)))
+                    if (v && jstr(v, ve, color, sizeof(color))) {
                         slot->tray_color = parse_color(color);
+                        // 8 位 RGBA(X2D/AMS2):alpha 非 00 才算有料色,否则
+                        // 纯黑料 "000000FF" 会被当成"无色"误判成空槽
+                        slot->color_valid = (strlen(color) >= 8)
+                            ? ((strtoul(color + 6, NULL, 16) & 0xFF) != 0)
+                            : (slot->tray_color != 0);
+                    }
+                    // remain = 剩余百分比(0~100),空槽为 -1;tray_weight = 整卷标称克数
+                    int pct = -1, weight = 0;
                     v = jpath(tr, tlen, "remain", &ve);
-                    if (v) slot->tray_remain = jint(v, ve, 0);
-                    slot->is_used = (slot->tray_type[0] != 0) || (slot->tray_color != 0);
-                    slot->active = (t == tray_now);
+                    if (v) pct = jint(v, ve, -1);
+                    v = jpath(tr, tlen, "tray_weight", &ve);
+                    if (v) weight = jint(v, ve, 0);
+                    slot->tray_pct    = pct;
+                    slot->tray_weight = weight;
+                    // 真实余量(克)= 整卷克数 × 剩余百分比(四舍五入);
+                    // 空槽(pct<0)或克数未知 → 0 克
+                    slot->tray_remain = (pct > 0 && weight > 0)
+                                        ? (weight * pct + 50) / 100 : 0;
+                    // X2D/AMS2 无 tray_type,料名/槽名在 tray_id_name
+                    v = jpath(tr, tlen, "tray_id_name", &ve);
+                    if (v && jstr(v, ve, name, sizeof(name)))
+                        copy_utf8(name, slot->tray_name, sizeof(slot->tray_name));
+                    // 有料判定:看有无耗材信息(材质/颜色/料名/标称克数),**不能只看 remain**。
+                    // 手动耗材或无 RFID 料卷 remain=-1 但材质颜色都在,仍算有料,
+                    // 只是余量未知(UI 显示 "--"),不能当成空槽把材质信息丢掉。
+                    // 真·空槽是连 tray_type/tray_color/tray_id_name 都没有的那种。
+                    slot->is_used = slot->tray_type[0] != 0 || slot->color_valid ||
+                                    slot->tray_name[0] != 0 || weight > 0 || pct > 0;
                     if (slot->is_used) used_slots++;
                 }
                 // 在位判定:有料槽数据或湿度/温度读数才计入(拓竹 ams.ams 数组常
@@ -401,11 +472,15 @@ static void parse_report(const char *data, int len)
                 if (a->present) s_state.ams_count = i + 1;
             }
 
-            if (s_state.ams_count > 0 && tray_now >= 0 && tray_now < BAMBU_TRAY_MAX) {
-                // 定位当前料槽所在 AMS(可能不是第一台),UI 需要高亮
-                for (int i = 0; i < s_state.ams_count; i++)
-                    if (s_state.ams[i].tray[tray_now].active) s_state.ams_active = true;
-            }
+                // tray_now 是全局槽号(AMS1=0..3,AMS2=4..7),据此标记活动槽
+                if (tray_now >= 0 && tray_now < BAMBU_AMS_MAX * BAMBU_TRAY_MAX) {
+                    int ai = tray_now / BAMBU_TRAY_MAX, ti = tray_now % BAMBU_TRAY_MAX;
+                    if (ai < s_state.ams_count && s_state.ams[ai].present) {
+                        s_state.ams[ai].tray[ti].active = true;
+                        s_state.ams_active = true;
+                    }
+                }
+            }   // if (has_ams)
 
             // 无 AMS → 退回外部料筒 vt_tray,塞进 ams[0] 并标记 present=false 便于 UI 区分
             if (s_state.ams_count == 0) {
@@ -416,15 +491,27 @@ static void parse_report(const char *data, int len)
                     bambu_ams_t *a = &s_state.ams[0];
                     a->present = false;                 // 表示"外部料筒"
                     a->humidity = -1;
-                    char type[8], color[8];
+                    char type[8], color[12];
                     v = jpath(vt, vtlen, "tray_type", &ve);
                     if (v && jstr(v, ve, type, sizeof(type)))
                         strlcpy(a->tray[0].tray_type, type, sizeof(a->tray[0].tray_type));
                     v = jpath(vt, vtlen, "tray_color", &ve);
-                    if (v && jstr(v, ve, color, sizeof(color)))
+                    if (v && jstr(v, ve, color, sizeof(color))) {
                         a->tray[0].tray_color = parse_color(color);
-                    v = jpath(vt, vtlen, "remain", &ve);
-                    if (v) a->tray[0].tray_remain = jint(v, ve, 0);
+                        a->tray[0].color_valid = (a->tray[0].tray_color != 0);
+                    }
+                    // 同上:remain 是百分比,真实克数需乘 tray_weight
+                    {
+                        int pct = -1, weight = 0;
+                        v = jpath(vt, vtlen, "remain", &ve);
+                        if (v) pct = jint(v, ve, -1);
+                        v = jpath(vt, vtlen, "tray_weight", &ve);
+                        if (v) weight = jint(v, ve, 0);
+                        a->tray[0].tray_pct    = pct;
+                        a->tray[0].tray_weight = weight;
+                        a->tray[0].tray_remain = (pct > 0 && weight > 0)
+                                                 ? (weight * pct + 50) / 100 : 0;
+                    }
                     a->tray[0].is_used = true;
                     a->tray[0].active = true;
                     s_state.ams_count = 1;
@@ -434,11 +521,12 @@ static void parse_report(const char *data, int len)
         }
 
         // ---------- HMS 错误码:数组元素取 code/ecode/hms_code ----------
+        // 只在报文携带 hms 字段时刷新(增量报文无 hms 段,避免误清告警)
         {
-            s_state.hms_count = 0;
             const char *he = NULL;
             const char *hms = jpath(pr, plen, "hms", &he);
             if (hms && hms < he) {
+                s_state.hms_count = 0;
                 const char *hp = jskip_ws(hms, he);
                 bool is_arr = (hp < he && *hp == '[');
                 for (int i = 0; i < BAMBU_HMS_MAX; i++) {
@@ -481,17 +569,18 @@ static void parse_report(const char *data, int len)
         if (now - s_last_summary > 10 * 1000000) {
             s_last_summary = now;
             ESP_LOGI(TAG,
-                     "摘要: state=%s pct=%d%% nz=%d/%d bed=%d/%d ams=%d hms=%d "
-                     "(A0 h=%d u=%d) (A1 h=%d u=%d) (A2 h=%d u=%d) (A3 h=%d u=%d) "
+                     "摘要: state=%s pct=%d%% nz=%d/%d bed=%d/%d cham=%d ams=%d hms=%d "
+                     "(A0 h=%d/%d u=%d) (A1 h=%d/%d u=%d) (A2 h=%d/%d u=%d) (A3 h=%d/%d u=%d) "
                      "job=%s heap=%d",
                      s_state.gcode_state, s_state.pct,
                      s_state.nozzle_t, s_state.nozzle_target,
                      s_state.bed_t, s_state.bed_target,
+                     s_state.chamber_t,
                      s_state.ams_count, s_state.hms_count,
-                     s_state.ams[0].humidity, s_state.ams[0].tray[0].is_used,
-                     s_state.ams[1].humidity, s_state.ams[1].tray[0].is_used,
-                     s_state.ams[2].humidity, s_state.ams[2].tray[0].is_used,
-                     s_state.ams[3].humidity, s_state.ams[3].tray[0].is_used,
+                     s_state.ams[0].humidity, s_state.ams[0].humidity_raw, s_state.ams[0].tray[0].is_used,
+                     s_state.ams[1].humidity, s_state.ams[1].humidity_raw, s_state.ams[1].tray[0].is_used,
+                     s_state.ams[2].humidity, s_state.ams[2].humidity_raw, s_state.ams[2].tray[0].is_used,
+                     s_state.ams[3].humidity, s_state.ams[3].humidity_raw, s_state.ams[3].tray[0].is_used,
                      s_state.job, (int)esp_get_free_heap_size());
         }
     }
@@ -503,7 +592,7 @@ static void push_pushall(void)
 {
     if (!s_cli) return;
     char topic[48], payload[40];
-    snprintf(topic, sizeof(topic), "device/%s/request", CFG_BAMBU_SERIAL);
+    snprintf(topic, sizeof(topic), "device/%s/request", sn());
     snprintf(payload, sizeof(payload), "{\"pushing\":{\"command\":\"pushall\"}}");
     esp_mqtt_client_publish(s_cli, topic, payload, 0, 0, 0);
 }
@@ -522,7 +611,7 @@ static void on_mqtt(void *handler_arg, esp_event_base_t base, int32_t id, void *
         // 订阅/printer/上报 topic,否则收不到打印机的 report 推送
         {
             char rt[48];
-            snprintf(rt, sizeof(rt), "device/%s/report", CFG_BAMBU_SERIAL);
+            snprintf(rt, sizeof(rt), "device/%s/report", sn());
             esp_mqtt_client_subscribe(s_cli, rt, 0);
             ESP_LOGI(TAG, "已订阅 %s", rt);
         }
@@ -560,14 +649,30 @@ void app_mqtt_start(void)
     state_reset_online_part();
     s_state.cloud = BAMBU_CLOUD_OFF;
 
-    bool configured = strncmp(CFG_BAMBU_TOKEN, "paste", 5) != 0;
+    // 凭据解析:NVS 优先,空则回落 secrets.h(老机器兼容)。
+    device_config_t cfgc;
+    config_load(&cfgc);
+    if (cfgc.bambu_uid[0]) {
+        // NVS 存 "u_<id>" 或纯 id,统一成 "u_<id>"
+        if (!strncmp(cfgc.bambu_uid, "u_", 2))
+            strlcpy(s_uid, cfgc.bambu_uid, sizeof(s_uid));
+        else
+            snprintf(s_uid, sizeof(s_uid), "u_%s", cfgc.bambu_uid);
+    } else {
+        snprintf(s_uid, sizeof(s_uid), "u_%s", CFG_BAMBU_USER_ID);
+    }
+    if (cfgc.bambu_token[0]) strlcpy(s_tok, cfgc.bambu_token, sizeof(s_tok));
+    else                     strlcpy(s_tok, CFG_BAMBU_TOKEN, sizeof(s_tok));
+    if (cfgc.bambu_sn[0])    strlcpy(s_sn, cfgc.bambu_sn, sizeof(s_sn));
+    else                     strlcpy(s_sn, CFG_BAMBU_SERIAL, sizeof(s_sn));
+
+    bool configured = s_tok[0] && strncmp(s_tok, "paste", 5) != 0;
     if (!configured) {
-        ESP_LOGW(TAG, "secrets.h 里拓竹 token 还是占位符,跳过云连接");
+        ESP_LOGW(TAG, "没有拓竹 token(查 NVS/secrets.h),跳过云连接。进'配网'填写账号。");
         return;
     }
 
-    char user[24], cid[20];
-    snprintf(user, sizeof(user), "u_%s", CFG_BAMBU_USER_ID);
+    char cid[20];
     snprintf(cid, sizeof(cid), "bbl_%06X", (unsigned)(esp_timer_get_time() >> 10) & 0xFFFFFF);
 
     esp_mqtt_client_config_t cfg = { 0 };
@@ -575,8 +680,8 @@ void app_mqtt_start(void)
     cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
     cfg.broker.address.port = 8883;
     cfg.broker.verification.crt_bundle_attach = &esp_crt_bundle_attach;
-    cfg.credentials.username = user;
-    cfg.credentials.authentication.password = CFG_BAMBU_TOKEN;
+    cfg.credentials.username = s_uid;
+    cfg.credentials.authentication.password = s_tok;
     cfg.credentials.client_id = cid;   // IDF 5.5: client_id 在 credentials 下
     cfg.buffer.size = 13 * 1024;       // 全量 AMS 报文约 11.4KB,留余量;越小越省堆
     cfg.buffer.out_size = 1024;
@@ -595,7 +700,7 @@ void app_mqtt_start(void)
     esp_timer_handle_t h;
     esp_timer_create(&t, &h);
     esp_timer_start_periodic(h, PUSH_PERIOD_US);
-    ESP_LOGI(TAG, "MQTT 启动:%s user=%s sn=%s", BROKER_HOST, user, CFG_BAMBU_SERIAL);
+    ESP_LOGI(TAG, "MQTT 启动:%s user=%s sn=%s", BROKER_HOST, s_uid, sn());
 }
 
 void app_mqtt_request_now(void)
@@ -610,7 +715,7 @@ static void publish_request(const char *payload, int qos)
 {
     if (!s_cli) { ESP_LOGW(TAG, "MQTT 未连接,命令丢弃"); return; }
     char topic[48];
-    snprintf(topic, sizeof(topic), "device/%s/request", CFG_BAMBU_SERIAL);
+    snprintf(topic, sizeof(topic), "device/%s/request", sn());
     int id = esp_mqtt_client_publish(s_cli, topic, payload, 0, qos, 0);
     ESP_LOGI(TAG, "发布 %s -> %s(%s)", payload, topic, id < 0 ? "失败" : "成功");
 }
@@ -648,4 +753,9 @@ int app_mqtt_uptime_sec(void)
 {
     if (s_conn_since == 0) return 0;
     return (int)((esp_timer_get_time() - s_conn_since) / 1000000LL);
+}
+
+const char *app_mqtt_sn(void)
+{
+    return sn();
 }

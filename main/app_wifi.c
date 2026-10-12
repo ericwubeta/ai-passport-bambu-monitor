@@ -3,6 +3,7 @@
 
 #include <string.h>
 
+#include "app_config.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -53,33 +54,36 @@ void app_wifi_start(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_ev = xEventGroupCreate();
 
-    bool configured = strncmp(CFG_WIFI_SSID, "YOUR_", 5) != 0;
+    // WiFi 凭据:优先 NVS(配网页写入),没有则回落 secrets.h(老机器兼容)。
+    device_config_t cfgc;
+    config_load(&cfgc);
+    const char *ssid = cfgc.wifi_ssid[0] ? cfgc.wifi_ssid : CFG_WIFI_SSID;
+    const char *pass = cfgc.wifi_pass[0] ? cfgc.wifi_pass : CFG_WIFI_PASS;
+
+    bool configured = strncmp(ssid, "YOUR_", 5) != 0;
     if (!configured) {
-        ESP_LOGW(TAG, "secrets.h 里 WiFi 还是占位符,跳过联网。"
-                      "填好 CFG_WIFI_SSID/CFG_WIFI_PASS 后重启生效。");
+        ESP_LOGW(TAG, "NVS 与 secrets.h 都没有 WiFi 配置,跳过联网。"
+                      "长按确定进菜单选'配网',或改 secrets.h 重编。");
         return;
     }
 
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    // 调高 WiFi 日志级别,排查关联失败
-    esp_log_level_set("wifi", ESP_LOG_DEBUG);
-    esp_log_level_set("wifi_init", ESP_LOG_DEBUG);
 
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_disconnect, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_ip, NULL);
 
     wifi_config_t wc = { 0 };
-    strlcpy((char *)wc.sta.ssid, CFG_WIFI_SSID, sizeof(wc.sta.ssid));
-    strlcpy((char *)wc.sta.password, CFG_WIFI_PASS, sizeof(wc.sta.password));
+    strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
     // 关闭省电模式,避免某些路由器关联超时
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_connect());   // start 只启动驱动,需手动发起关联
-    ESP_LOGI(TAG, "WiFi 启动,连接 %s ...", CFG_WIFI_SSID);
+    ESP_LOGI(TAG, "WiFi 启动,连接 %s ...", ssid);
 }
 
 bool app_wifi_connected(void)

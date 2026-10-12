@@ -19,10 +19,15 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-#include "secrets.h"
-
 #define PAGE_MAX 8          // 最多 2(固定)+4(AMS)+1(设备)+1(控制)
 #define MSG_MAX  48
+
+// 版面几何:上方 32..50 是常驻状态条(告警/云摘要),页面区从 52 起到屏底。
+// 状态条常驻而非"有告警才弹出",这样告警出现时不会盖住页面内容、布局也不跳变。
+#define BAR_Y     32
+#define BAR_H     18
+#define PAGE_Y    52
+#define PAGE_H    268        // 52 + 268 = 320(屏底)
 
 // 配色:工业仪表盘 —— 深蓝黑 + 拓竹荧光绿 + 喷嘴橙
 #define C_BG      0x0B0F16
@@ -42,43 +47,43 @@ static lv_obj_t *s_scr;
 static lv_obj_t *s_pages[PAGE_MAX];
 static int s_pages_n;
 static int s_cur;
+static int s_slot[PAGE_MAX];   // 导航序号 → 实体页槽位(实体固定:0进度 1温度 2~5AMS 6设备 7控制)
 static lv_timer_t *s_timer;
+static lv_timer_t *s_fast;     // 30ms 快速重绘:承接按键回调里延后的重绘请求
+static bool s_need_refresh;    // 按键触发的重绘请求(放到 LVGL 任务里执行)
+static bsp_btn_t   s_pk_btn;   // 挂起的按键(按钮回调只记录,不干活)
+static bsp_btn_ev_t s_pk_ev;
+static bool        s_pk_valid;
 static bool s_active;
 
 // 头部
-static lv_obj_t *s_time, *s_bat_pct, *s_bat_fill;
+static lv_obj_t *s_time, *s_bat_pct, *s_bat_fill, *s_cloud_dot;
 static lv_obj_t *s_dots[PAGE_MAX];
-// HMS 横幅
-static lv_obj_t *s_hms_bar;
+// 常驻状态条(有 HMS 时显示告警,否则显示云/WiFi 摘要)
+static lv_obj_t *s_bar, *s_bar_lbl;
 
 // 进度页
-static lv_obj_t *s_status, *s_job, *s_ring_digits, *s_pct_sign;
-// 平滑圆环:LVGL SW 渲染圆弧 mask(circ_calc_aa4)在本机卡死,改用 lv_line 折线拼
-// 圆环(线渲染,平头,不触发圆弧 mask),72 段足够平滑且只占几百字节点数组。
-#define RING_N  72
-#define RING_CX 120
-#define RING_CY 150
-#define RING_R  62
-static lv_obj_t *s_ring_bg, *s_ring_fg;
-static lv_point_precise_t s_ring_bg_pts[RING_N + 1], s_ring_fg_pts[RING_N + 1];
+static lv_obj_t *s_status, *s_job, *s_pct_box, *s_pct_sign;
+static lv_obj_t *s_prog_track, *s_prog_fill;   // 横向进度条(替代折线圆环)
 static lv_obj_t *s_time_lbl, *s_time_hint;
 // 温度/层/风扇 chip(进度页下方 2x2)
 static lv_obj_t *s_c_noz_v, *s_c_bed_v, *s_c_layer_v, *s_c_fan_v;
 static bool s_show_eta;      // false=显示剩余;true=显示完成时刻
-static int s_last_pct = -1;  // 上次绘制的百分比(重进页面时需重置,否则首刷不重画数字)
 // 温度页
-static lv_obj_t *s_noz_cur, *s_noz_tgt, *s_noz_bar;
-static lv_obj_t *s_bed_cur, *s_bed_tgt, *s_bed_bar;
-static lv_obj_t *s_cham_cur;
+static lv_obj_t *s_noz_cur, *s_noz_tgt, *s_noz_bar, *s_noz_mark;
+static lv_obj_t *s_bed_cur, *s_bed_tgt, *s_bed_bar, *s_bed_mark;
+static lv_obj_t *s_cham_cur, *s_cham_bar;
 static lv_obj_t *s_temp_remain;
 // AMS 页(最多 4 台 × 4 槽)
-static lv_obj_t *s_ams_title[4];
+static lv_obj_t *s_ams_title[4], *s_ams_sub[4];
 static lv_obj_t *s_ams_swatch[4][4], *s_ams_type[4][4], *s_ams_remain[4][4], *s_ams_mark[4][4];
+static lv_obj_t *s_ams_gauge[4][4];     // 槽位右侧余量竖条
 // 设备页
 static lv_obj_t *s_d_sn, *s_d_rssi, *s_d_ip, *s_d_cloud, *s_d_bat, *s_d_wifi, *s_d_uptime;
 static lv_obj_t *s_d_hms_panel, *s_d_hms_lbl;
 // 控制页
 static lv_obj_t *s_ctl_title, *s_ctl_items[3], *s_ctl_labels[3], *s_ctl_state;
+static lv_obj_t *s_ctl_arm_bar;   // 停止二次确认倒计时条
 static int  s_ctl_sel;
 static bool s_stop_armed;
 static int64_t s_stop_armed_at;   // esp_timer us
@@ -86,6 +91,32 @@ static bool s_light_on;           // 乐观腔灯状态
 
 // 上次打印状态(用于状态切换提示音)
 static char s_last_state[10];
+
+// 脏检查:数据快照没变时跳过整页重绘,只刷时钟/电量(省电、避免无谓重排)
+static bambu_state_t s_prev;
+static bool s_prev_valid;
+static bool s_dirty = true;       // 按键等交互强制重绘
+
+static void refresh_all(void);    // 前向声明(tick_fast 要调,定义在后面)
+static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev);
+
+// 按键回调跑在 button 组件的小栈任务(默认 2~3KB)里,而翻页/重绘很重:
+// refresh_all() 会把 bambu_state_t 大结构体上栈 + memcpy + 一堆 LVGL/字体调用,
+// 在回调里直接干会爆栈 → 看门狗/栈溢出 → 设备重启(「按两回上键就重启」的根因)。
+// 所以按键回调只记下事件,由 s_fast 定时器在 LVGL 任务(栈足够)里真正执行。
+static void request_refresh(void) { s_dirty = true; s_need_refresh = true; }
+
+static void tick_fast(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_active) return;
+    if (s_pk_valid) {                       // 先消费挂起的按键(在 LVGL 任务里跑)
+        bsp_btn_t b = s_pk_btn; bsp_btn_ev_t e = s_pk_ev;
+        s_pk_valid = false;
+        key_handle(b, e);
+    }
+    if (s_need_refresh) { s_need_refresh = false; refresh_all(); }
+}
 
 // ------------------------------------------------------------ 基础控件
 
@@ -117,6 +148,14 @@ static void set_bar_pct(lv_obj_t *bar, int pct, int max_w)
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     lv_obj_set_width(bar, max_w * pct / 100);
+}
+
+// 目标温度刻度线:竖线画在进度条上对应目标值的位置
+static void set_bar_mark(lv_obj_t *mark, int pct, int max_w, int x0)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    lv_obj_set_x(mark, x0 + max_w * pct / 100 - 1);
 }
 
 // 圆角卡片(带细边框)
@@ -220,11 +259,14 @@ static void header_build(void)
     lv_label_set_text(s_time, "--:--");
     lv_obj_align(s_time, LV_ALIGN_TOP_LEFT, 8, 7);
 
-    // 页点(居中,最多 6 个,按实际页数显示)
+    // 云/网络状态点(时钟右侧):绿=云在线 黄=连接中 灰=离线 红=WiFi 未连
+    s_cloud_dot = rect(s_scr, 54, 12, 6, 6, C_DIM);
+    lv_obj_set_style_radius(s_cloud_dot, LV_RADIUS_CIRCLE, 0);
+
+    // 页点(居中,最多 8 个,按实际页数显示)
     for (int i = 0; i < PAGE_MAX; i++) {
-        s_dots[i] = rect(s_scr, 92 + i * 10, 13, 5, 5, C_LINE);
+        s_dots[i] = rect(s_scr, 88 + i * 10, 13, 5, 5, C_LINE);
         lv_obj_set_style_radius(s_dots[i], LV_RADIUS_CIRCLE, 0);
-        if (i >= 6) lv_obj_add_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
     }
 
     // 电量:图标右置(210-236),百分比文字在图标左侧,互不重叠
@@ -242,30 +284,39 @@ static void header_build(void)
     rect(s_scr, 236, 12, 3, 7, C_DIM);
 }
 
-// HMS 横幅:header 下方覆盖条,有错误才显示
-static void hms_bar_build(void)
+// 常驻状态条(header 下方 18px):有 HMS 显示告警,否则显示云/WiFi 摘要。
+// 常驻而非"有告警才弹出":告警时不会盖住页面内容,布局也不会跳变。
+static void status_bar_build(void)
 {
-    s_hms_bar = rect(s_scr, 0, 32, 240, 20, C_RED);
-    lv_obj_set_style_radius(s_hms_bar, 0, 0);
-    lv_obj_add_flag(s_hms_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *l = label(s_hms_bar, &font_zh14, 0xFFFFFF, LV_TEXT_ALIGN_LEFT);
-    lv_obj_align(l, LV_ALIGN_LEFT_MID, 8, 0);
-    lv_obj_set_user_data(s_hms_bar, l);   // 存 label 指针供刷新
+    s_bar = rect(s_scr, 0, BAR_Y, 240, BAR_H, C_PANEL);
+    lv_obj_set_style_radius(s_bar, 0, 0);
+    rect(s_scr, 0, BAR_Y + BAR_H, 240, 1, C_LINE);
+    s_bar_lbl = label(s_bar, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+    lv_label_set_text(s_bar_lbl, "等待数据");
+    lv_label_set_long_mode(s_bar_lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(s_bar_lbl, 226);
+    lv_obj_align(s_bar_lbl, LV_ALIGN_LEFT_MID, 7, 0);
 }
 
-static void refresh_hms_bar(const bambu_state_t *st)
+static void refresh_status_bar(const bambu_state_t *st)
 {
-    lv_obj_t *l = lv_obj_get_user_data(s_hms_bar);
     if (st->hms_count > 0) {
         char buf[MSG_MAX];
         const char *txt = hms_lookup(st->hms[0].code, buf, sizeof(buf));
-        // 横幅宽度有限:只显示描述,过长截断
-        lv_label_set_text(l, txt);
-        lv_obj_set_style_bg_color(s_hms_bar, lv_color_hex(
-            (st->gcode_state[0] && !strcmp(st->gcode_state, "PAUSE")) ? C_YELLOW : C_RED), 0);
-        lv_obj_remove_flag(s_hms_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_bar_lbl, txt);
+        bool paused = st->gcode_state[0] && !strcmp(st->gcode_state, "PAUSE");
+        lv_obj_set_style_bg_color(s_bar, lv_color_hex(paused ? C_YELLOW : C_RED), 0);
+        lv_obj_set_style_text_color(s_bar_lbl,
+            lv_color_hex(paused ? 0x241A00 : 0xFFFFFF), 0);
     } else {
-        lv_obj_add_flag(s_hms_bar, LV_OBJ_FLAG_HIDDEN);
+        const char *cloud = st->cloud == BAMBU_CLOUD_ONLINE    ? "云在线"
+                          : st->cloud == BAMBU_CLOUD_CONNECTING ? "云连接中" : "云离线";
+        char t[40];
+        if (st->wifi_signal) snprintf(t, sizeof(t), "%s · 打印机 %d dBm", cloud, st->wifi_signal);
+        else                 snprintf(t, sizeof(t), "%s · 打印机信号 --", cloud);
+        lv_label_set_text(s_bar_lbl, t);
+        lv_obj_set_style_bg_color(s_bar, lv_color_hex(C_PANEL), 0);
+        lv_obj_set_style_text_color(s_bar_lbl, lv_color_hex(C_DIM), 0);
     }
 }
 
@@ -275,58 +326,44 @@ static void page_progress_build(lv_obj_t *p)
 {
     s_status = label(p, &font_zh20, C_GREEN, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text(s_status, "空闲");
-    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 2);
+    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 0);
 
     s_job = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text(s_job, "等待任务");
-    lv_obj_align(s_job, LV_ALIGN_TOP_MID, 0, 28);
+    lv_obj_align(s_job, LV_ALIGN_TOP_MID, 0, 22);
     lv_label_set_long_mode(s_job, LV_LABEL_LONG_CLIP);
     lv_obj_set_width(s_job, 220);
 
-    // 平滑圆环:背景闭合环 + 进度弧(均为 lv_line 折线,避开圆弧 mask 卡死)
-    for (int i = 0; i < RING_N; i++) {
-        double a = (i * 360.0 / RING_N) * (M_PI / 180.0);
-        s_ring_bg_pts[i].x = RING_CX + (int)(RING_R * sin(a) + 0.5);
-        s_ring_bg_pts[i].y = RING_CY - (int)(RING_R * cos(a) + 0.5);
-    }
-    s_ring_bg_pts[RING_N] = s_ring_bg_pts[0];
-    s_ring_bg = lv_line_create(p);
-    lv_obj_set_style_line_width(s_ring_bg, 10, 0);
-    lv_obj_set_style_line_color(s_ring_bg, lv_color_hex(C_LINE), 0);
-    lv_line_set_points(s_ring_bg, s_ring_bg_pts, RING_N + 1);
-    lv_obj_remove_flag(s_ring_bg, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_ring_fg = lv_line_create(p);
-    lv_obj_set_style_line_width(s_ring_fg, 10, 0);
-    lv_obj_set_style_line_color(s_ring_fg, lv_color_hex(C_GREEN), 0);
-    lv_line_set_points(s_ring_fg, s_ring_fg_pts, 1);
-    lv_obj_remove_flag(s_ring_fg, LV_OBJ_FLAG_SCROLLABLE);
-
-    // 圈内大 %(点阵数字,动态居中)
-    s_ring_digits = rect(p, 0, 0, 4, 4, C_BG);
-    lv_obj_set_style_bg_opa(s_ring_digits, LV_OPA_TRANSP, 0);
-    draw_digits(s_ring_digits, "0", 6, C_TEXT);
-    lv_obj_set_pos(s_ring_digits, 0, 0);
-    lv_obj_center(s_ring_digits);
+    // 大号居中百分比(像素数字) + 横向圆角进度条(替代原折线圆环)
+    s_pct_box = rect(p, 0, 0, 4, 4, C_BG);
+    lv_obj_set_style_bg_opa(s_pct_box, LV_OPA_TRANSP, 0);
+    draw_digits(s_pct_box, "0", 7, C_TEXT);
+    lv_obj_set_pos(s_pct_box, 0, 0);
 
     s_pct_sign = label(p, &font_zh20, C_DIM, LV_TEXT_ALIGN_LEFT);
     lv_label_set_text(s_pct_sign, "%");
+    lv_obj_set_style_text_font(s_pct_sign, &font_zh20, 0);
+
+    // 横向进度条:轨道(圆角卡片) + 填充
+    s_prog_track = card(p, 20, 150, 200, 16, C_PANEL2);
+    s_prog_fill  = rect(p, 22, 152, 0, 12, C_GREEN);
+    lv_obj_set_style_radius(s_prog_fill, 6, 0);
 
     // 温度/层/风扇 chip(2x2)
     lv_obj_t *kl;
-    chip_build(p, 14, 222, 108, 20, "喷嘴", C_ORANGE, &kl, &s_c_noz_v);
-    chip_build(p, 118, 222, 108, 20, "热床", C_GREEN_L, &kl, &s_c_bed_v);
-    chip_build(p, 14, 244, 108, 20, "层", C_CYAN, &kl, &s_c_layer_v);
-    chip_build(p, 118, 244, 108, 20, "风扇", C_DIM, &kl, &s_c_fan_v);
+    chip_build(p, 14, 188, 108, 20, "喷嘴", C_ORANGE, &kl, &s_c_noz_v);
+    chip_build(p, 118, 188, 108, 20, "热床", C_GREEN_L, &kl, &s_c_bed_v);
+    chip_build(p, 14, 210, 108, 20, "层", C_CYAN, &kl, &s_c_layer_v);
+    chip_build(p, 118, 210, 108, 20, "风扇", C_DIM, &kl, &s_c_fan_v);
 
     // 剩余 / 完成时刻(OK 切换)
     s_time_lbl = label(p, &font_zh20, C_GREEN_L, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text(s_time_lbl, "--");
-    lv_obj_align(s_time_lbl, LV_ALIGN_TOP_MID, 0, 268);
+    lv_obj_align(s_time_lbl, LV_ALIGN_TOP_MID, 0, 232);
 
     s_time_hint = label(p, &font_zh14, 0x445262, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text(s_time_hint, "OK 切换剩余/完成");
-    lv_obj_align(s_time_hint, LV_ALIGN_TOP_MID, 0, 294);
+    lv_obj_align(s_time_hint, LV_ALIGN_TOP_MID, 0, 254);
 }
 
 static void refresh_progress(const bambu_state_t *st)
@@ -337,43 +374,35 @@ static void refresh_progress(const bambu_state_t *st)
     lv_obj_set_style_text_color(s_status, lv_color_hex(st_col), 0);
     lv_label_set_text(s_job, st->job[0] ? st->job : "等待任务");
 
-    // 平滑圆环:进度弧按 pct 生成折线点(状态色)
-    {
-        uint32_t col = state_ring_color(st->gcode_state);
-        lv_obj_set_style_line_color(s_ring_fg, lv_color_hex(col), 0);
-        int n = (st->pct * RING_N) / 100;
-        if (n > RING_N) n = RING_N;
-        for (int i = 0; i <= n; i++) {
-            double a = (i * 360.0 / RING_N) * (M_PI / 180.0);
-            s_ring_fg_pts[i].x = RING_CX + (int)(RING_R * sin(a) + 0.5);
-            s_ring_fg_pts[i].y = RING_CY - (int)(RING_R * cos(a) + 0.5);
-        }
-        lv_line_set_points(s_ring_fg, s_ring_fg_pts, n + 1);
-    }
-
-    // 中心大 %(位数变化时收缩字号)
+    // 大号百分比 + 横向进度条(替代折线圆环)
+    uint32_t num_col = state_ring_color(st->gcode_state);
     char dts[8];
     snprintf(dts, sizeof(dts), "%d", st->pct);
     int n = strlen(dts);
-    int scale = n >= 3 ? 5 : 6;
+    int scale = 7;
     int dig_h = 7 * scale;
-    int w = digits_width(n, scale);
-    lv_obj_set_size(s_ring_digits, w, dig_h);
-    lv_obj_center(s_ring_digits);
-    if (st->pct != s_last_pct) {
-        s_last_pct = st->pct;
-        draw_digits(s_ring_digits, dts, scale, C_TEXT);
-    }
-    // % 号贴数字右侧、垂直居中
-    int cx = (240 - w) / 2;
-    lv_obj_set_pos(s_pct_sign, cx + w + 8, 138);
-    lv_obj_set_style_text_font(s_pct_sign, &font_zh20, 0);
+    int num_w = digits_width(n, scale);
+    int pct_w = 18, gap = 6;
+    int total = num_w + gap + pct_w;
+    int sx = (240 - total) / 2;
+    int cy = 95;
+    lv_obj_set_size(s_pct_box, num_w, dig_h);
+    lv_obj_set_pos(s_pct_box, sx, cy - dig_h / 2);
+    draw_digits(s_pct_box, dts, scale, num_col);
+    lv_obj_set_pos(s_pct_sign, sx + num_w + gap, cy - 11);
+    lv_obj_set_style_text_color(s_pct_sign, lv_color_hex(num_col), 0);
 
-    // 温度/层/风扇 chip
+    // 进度条填充(轨道内 2px 边距,最大宽 196)
+    int fill_w = (196 * st->pct) / 100;
+    if (fill_w < 0) fill_w = 0; else if (fill_w > 196) fill_w = 196;
+    lv_obj_set_width(s_prog_fill, fill_w);
+    lv_obj_set_style_bg_color(s_prog_fill, lv_color_hex(num_col), 0);
+
+    // 温度/层/风扇 chip(温度显示 当前/目标)
     char t[24];
-    snprintf(t, sizeof(t), "%d°", st->nozzle_t);
+    snprintf(t, sizeof(t), "%d/%d", st->nozzle_t, st->nozzle_target);
     lv_label_set_text(s_c_noz_v, t);
-    snprintf(t, sizeof(t), "%d°", st->bed_t);
+    snprintf(t, sizeof(t), "%d/%d", st->bed_t, st->bed_target);
     lv_label_set_text(s_c_bed_v, t);
     snprintf(t, sizeof(t), "%d/%d", st->layer, st->total_layer);
     lv_label_set_text(s_c_layer_v, t);
@@ -410,65 +439,80 @@ static void refresh_progress(const bambu_state_t *st)
 static void page_temp_build(lv_obj_t *p)
 {
     // 喷头
-    card(p, 10, 6, 220, 68, C_PANEL);
+    card(p, 10, 2, 220, 62, C_PANEL);
     lv_obj_t *n1 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n1, "喷头"); lv_obj_align(n1, LV_ALIGN_TOP_LEFT, 20, 12);
+    lv_label_set_text(n1, "喷头"); lv_obj_align(n1, LV_ALIGN_TOP_LEFT, 20, 8);
     s_noz_cur = label(p, &lv_font_montserrat_20, C_ORANGE, LV_TEXT_ALIGN_RIGHT);
     lv_label_set_text(s_noz_cur, "--");
-    lv_obj_align(s_noz_cur, LV_ALIGN_TOP_RIGHT, -20, 8);
+    lv_obj_align(s_noz_cur, LV_ALIGN_TOP_RIGHT, -20, 4);
     s_noz_tgt = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_RIGHT);
     lv_label_set_text(s_noz_tgt, "目标 --");
-    lv_obj_align(s_noz_tgt, LV_ALIGN_TOP_RIGHT, -20, 36);
-    rect(p, 20, 62, 200, 6, C_LINE);
-    s_noz_bar = rect(p, 20, 62, 0, 6, C_ORANGE);
+    lv_obj_align(s_noz_tgt, LV_ALIGN_TOP_RIGHT, -20, 30);
+    rect(p, 20, 50, 200, 6, C_LINE);
+    s_noz_bar = rect(p, 20, 50, 0, 6, C_ORANGE);
+    s_noz_mark = rect(p, 20, 45, 2, 16, C_TEXT);
 
     // 热床
-    card(p, 10, 80, 220, 68, C_PANEL);
+    card(p, 10, 68, 220, 62, C_PANEL);
     lv_obj_t *n2 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n2, "热床"); lv_obj_align(n2, LV_ALIGN_TOP_LEFT, 20, 86);
+    lv_label_set_text(n2, "热床"); lv_obj_align(n2, LV_ALIGN_TOP_LEFT, 20, 74);
     s_bed_cur = label(p, &lv_font_montserrat_20, C_GREEN_L, LV_TEXT_ALIGN_RIGHT);
     lv_label_set_text(s_bed_cur, "--");
-    lv_obj_align(s_bed_cur, LV_ALIGN_TOP_RIGHT, -20, 82);
+    lv_obj_align(s_bed_cur, LV_ALIGN_TOP_RIGHT, -20, 70);
     s_bed_tgt = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_RIGHT);
     lv_label_set_text(s_bed_tgt, "目标 --");
-    lv_obj_align(s_bed_tgt, LV_ALIGN_TOP_RIGHT, -20, 110);
-    rect(p, 20, 136, 200, 6, C_LINE);
-    s_bed_bar = rect(p, 20, 136, 0, 6, C_GREEN_L);
+    lv_obj_align(s_bed_tgt, LV_ALIGN_TOP_RIGHT, -20, 96);
+    rect(p, 20, 116, 200, 6, C_LINE);
+    s_bed_bar = rect(p, 20, 116, 0, 6, C_GREEN_L);
+    s_bed_mark = rect(p, 20, 111, 2, 16, C_TEXT);
 
     // 腔温
-    card(p, 10, 154, 220, 62, C_PANEL);
+    card(p, 10, 134, 220, 58, C_PANEL);
     lv_obj_t *n3 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n3, "腔温"); lv_obj_align(n3, LV_ALIGN_TOP_LEFT, 20, 172);
+    lv_label_set_text(n3, "腔温"); lv_obj_align(n3, LV_ALIGN_TOP_LEFT, 20, 148);
     s_cham_cur = label(p, &lv_font_montserrat_20, C_CYAN, LV_TEXT_ALIGN_RIGHT);
     lv_label_set_text(s_cham_cur, "--");
-    lv_obj_align(s_cham_cur, LV_ALIGN_TOP_RIGHT, -20, 168);
+    lv_obj_align(s_cham_cur, LV_ALIGN_TOP_RIGHT, -20, 144);
+    rect(p, 20, 176, 200, 6, C_LINE);
+    s_cham_bar = rect(p, 20, 176, 0, 6, C_CYAN);
 
     // 预计剩余
-    card(p, 10, 222, 220, 58, C_PANEL);
+    card(p, 10, 196, 220, 58, C_PANEL);
     lv_obj_t *n4 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n4, "预计剩余"); lv_obj_align(n4, LV_ALIGN_TOP_LEFT, 20, 240);
+    lv_label_set_text(n4, "预计剩余"); lv_obj_align(n4, LV_ALIGN_TOP_LEFT, 20, 214);
     s_temp_remain = label(p, &lv_font_montserrat_20, C_GREEN_L, LV_TEXT_ALIGN_RIGHT);
     lv_label_set_text(s_temp_remain, "--");
-    lv_obj_align(s_temp_remain, LV_ALIGN_TOP_RIGHT, -20, 236);
+    lv_obj_align(s_temp_remain, LV_ALIGN_TOP_RIGHT, -20, 210);
 }
 
 static void refresh_temp(const bambu_state_t *st)
 {
     char t[24];
+    // 量程跟随目标温度:PLA 热床 60° 时条也能走满,不再看着像"只到一半"
+    int noz_max = st->nozzle_target > 0 ? st->nozzle_target + 30 : 300;
+    int bed_max = st->bed_target > 0 ? st->bed_target + 20 : 120;
+    if (noz_max < 200) noz_max = 200;
+    if (bed_max < 60)  bed_max = 60;
+
     snprintf(t, sizeof(t), "%d°", st->nozzle_t);
     lv_label_set_text(s_noz_cur, t);
     snprintf(t, sizeof(t), "目标 %d°", st->nozzle_target);
     lv_label_set_text(s_noz_tgt, t);
-    set_bar_pct(s_noz_bar, st->nozzle_t * 100 / 300, 200);
+    set_bar_pct(s_noz_bar, st->nozzle_t * 100 / noz_max, 200);
+    set_bar_mark(s_noz_mark, st->nozzle_target * 100 / noz_max, 200, 20);
 
     snprintf(t, sizeof(t), "%d°", st->bed_t);
     lv_label_set_text(s_bed_cur, t);
     snprintf(t, sizeof(t), "目标 %d°", st->bed_target);
     lv_label_set_text(s_bed_tgt, t);
-    set_bar_pct(s_bed_bar, st->bed_t * 100 / 120, 200);
+    set_bar_pct(s_bed_bar, st->bed_t * 100 / bed_max, 200);
+    set_bar_mark(s_bed_mark, st->bed_target * 100 / bed_max, 200, 20);
 
-    snprintf(t, sizeof(t), "%d°", st->chamber_t);
+    // 腔温 0 = 机型无腔温传感器(未上报),显示 -- 而非误导性的 0°
+    if (st->chamber_t > 0) snprintf(t, sizeof(t), "%d°", st->chamber_t);
+    else                   strcpy(t, "--");
     lv_label_set_text(s_cham_cur, t);
+    set_bar_pct(s_cham_bar, st->chamber_t * 100 / 60, 200);   // 腔温量程 60℃
 
     if (st->remain_min > 0) {
         int h = st->remain_min / 60, m = st->remain_min % 60;
@@ -484,32 +528,47 @@ static void refresh_temp(const bambu_state_t *st)
 
 static void page_ams_build(lv_obj_t *p, int ams_idx)
 {
-    // 标题(刷新时更新台数)
+    // 标题(刷新时更新台数/湿度)
     s_ams_title[ams_idx] = label(p, &font_zh14, C_GREEN_L, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text(s_ams_title[ams_idx], "耗材 · AMS");
-    lv_obj_align(s_ams_title[ams_idx], LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_align(s_ams_title[ams_idx], LV_ALIGN_TOP_MID, 0, 4);
+    // 副标题:当前在用槽的完整料名(卡片里只放得下材质简称)
+    s_ams_sub[ams_idx] = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(s_ams_sub[ams_idx], "在用 --");
+    lv_label_set_long_mode(s_ams_sub[ams_idx], LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(s_ams_sub[ams_idx], 220);
+    lv_obj_align(s_ams_sub[ams_idx], LV_ALIGN_TOP_MID, 0, 20);
 
     // 2x2 料槽卡片(每张 100x98)
     static const int GX[4] = { 14, 126 };
-    static const int GY[4] = { 38, 146 };
+    static const int GY[4] = { 44, 148 };
     for (int i = 0; i < 4; i++) {
         int col = i % 2, row = i / 2;
         int x = GX[col], y = GY[row];
         card(p, x, y, 100, 98, C_PANEL2);
 
-        s_ams_swatch[ams_idx][i] = rect(p, x + 14, y + 10, 44, 44, 0x141C26);
+        s_ams_swatch[ams_idx][i] = rect(p, x + 9, y + 8, 58, 52, 0x141C26);
         lv_obj_set_style_radius(s_ams_swatch[ams_idx][i], 6, 0);
         lv_obj_set_style_border_width(s_ams_swatch[ams_idx][i], 2, 0);
         lv_obj_set_style_border_color(s_ams_swatch[ams_idx][i], lv_color_hex(C_LINE), 0);
 
+        // 右侧余量竖条(满量程 1000g),填充自底向上
+        lv_obj_t *track = rect(p, x + 73, y + 8, 12, 52, C_LINE);
+        lv_obj_set_style_radius(track, 3, 0);
+        s_ams_gauge[ams_idx][i] = rect(track, 0, 0, 12, 0, C_GREEN_L);
+        lv_obj_set_style_radius(s_ams_gauge[ams_idx][i], 3, 0);
+        lv_obj_align(s_ams_gauge[ams_idx][i], LV_ALIGN_BOTTOM_MID, 0, 0);
+
         s_ams_type[ams_idx][i] = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
-        lv_obj_align(s_ams_type[ams_idx][i], LV_ALIGN_TOP_LEFT, x + 12, y + 62);
+        lv_label_set_long_mode(s_ams_type[ams_idx][i], LV_LABEL_LONG_DOT);
+        lv_obj_set_width(s_ams_type[ams_idx][i], 84);   // 材质/料名过长省略号截断
+        lv_obj_align(s_ams_type[ams_idx][i], LV_ALIGN_TOP_LEFT, x + 9, y + 64);
 
         s_ams_remain[ams_idx][i] = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-        lv_obj_align(s_ams_remain[ams_idx][i], LV_ALIGN_TOP_LEFT, x + 12, y + 80);
+        lv_obj_align(s_ams_remain[ams_idx][i], LV_ALIGN_TOP_LEFT, x + 9, y + 82);
 
         // 活动标记(色块右上角绿点)
-        s_ams_mark[ams_idx][i] = rect(p, x + 52, y + 4, 8, 8, C_GREEN);
+        s_ams_mark[ams_idx][i] = rect(p, x + 60, y + 2, 8, 8, C_GREEN);
         lv_obj_set_style_radius(s_ams_mark[ams_idx][i], LV_RADIUS_CIRCLE, 0);
         lv_obj_add_flag(s_ams_mark[ams_idx][i], LV_OBJ_FLAG_HIDDEN);
     }
@@ -524,23 +583,43 @@ static void refresh_ams(const bambu_state_t *st, int ams_idx, int total_ams)
         // 外部料筒
         lv_label_set_text(s_ams_title[ams_idx], "外部料筒");
     } else {
-        if (a->temp > 0)
-            snprintf(t, sizeof(t), "AMS %d · %d 台 · 干燥 %d · %d°",
+        if (a->humidity_raw > 0 && a->temp > 0)
+            snprintf(t, sizeof(t), "AMS %d · %d台 · 湿%d%% · %d°",
+                     ams_idx + 1, total_ams, a->humidity_raw, a->temp);
+        else if (a->temp > 0)
+            snprintf(t, sizeof(t), "AMS %d · %d台 · 干燥%d · %d°",
                      ams_idx + 1, total_ams,
                      a->humidity >= 0 ? a->humidity : 0, a->temp);
         else
-            snprintf(t, sizeof(t), "AMS %d · %d 台 · 干燥 %d",
+            snprintf(t, sizeof(t), "AMS %d · %d台 · 干燥%d",
                      ams_idx + 1, total_ams,
                      a->humidity >= 0 ? a->humidity : 0);
         lv_label_set_text(s_ams_title[ams_idx], t);
     }
 
+    // 副标题:卡片里只有 6 个字的空间,完整料名放这里
+    char sub[56];
+    const char *active_name = NULL;
+    for (int i = 0; i < 4; i++) {
+        if (a->tray[i].active && a->tray[i].is_used) {
+            // 手动耗材没有 tray_id_name,退回材质名(如 PLA),别显示空的"在用 "
+            active_name = a->tray[i].tray_name[0] ? a->tray[i].tray_name
+                                                  : a->tray[i].tray_type;
+            break;
+        }
+    }
+    if (active_name && active_name[0]) snprintf(sub, sizeof(sub), "在用 %s", active_name);
+    else if (!a->present)              snprintf(sub, sizeof(sub), "外部料筒 · 无 AMS 数据");
+    else                               snprintf(sub, sizeof(sub), "在用 --");
+    lv_label_set_text(s_ams_sub[ams_idx], sub);
+
     for (int i = 0; i < 4; i++) {
         const bambu_tray_t *slot = &a->tray[i];
         bool used = slot->is_used;
-        // 色块
-        lv_obj_set_style_bg_color(s_ams_swatch[ams_idx][i],
-            lv_color_hex(used ? (slot->tray_color ? slot->tray_color : 0x22303F) : 0x141C26), 0);
+        // 色块(color_valid 区分"无色"与纯黑,纯黑料显示真黑色)
+        uint32_t swc = used ? (slot->color_valid ? slot->tray_color : 0x22303F)
+                            : 0x141C26;
+        lv_obj_set_style_bg_color(s_ams_swatch[ams_idx][i], lv_color_hex(swc), 0);
         // 活动槽高亮边框
         uint32_t bcol = slot->active ? C_GREEN_L : C_LINE;
         lv_obj_set_style_border_color(s_ams_swatch[ams_idx][i], lv_color_hex(bcol), 0);
@@ -548,13 +627,34 @@ static void refresh_ams(const bambu_state_t *st, int ams_idx, int total_ams)
         if (slot->active) lv_obj_remove_flag(s_ams_mark[ams_idx][i], LV_OBJ_FLAG_HIDDEN);
         else              lv_obj_add_flag(s_ams_mark[ams_idx][i], LV_OBJ_FLAG_HIDDEN);
 
-        // 型号 + 余量
-        lv_label_set_text(s_ams_type[ams_idx][i], used ? slot->tray_type : "-");
+        // 有 tray_type 显示材质(PLA/PETG);X2D/AMS2 只有 tray_name(料名),用青色区分
+        const char *label_txt = "-";
         if (used)
-            snprintf(t, sizeof(t), "%dg", slot->tray_remain);
-        else
+            label_txt = slot->tray_type[0] ? slot->tray_type : slot->tray_name;
+        lv_label_set_text(s_ams_type[ams_idx][i], label_txt);
+        lv_obj_set_style_text_color(s_ams_type[ams_idx][i],
+            lv_color_hex(slot->tray_type[0] ? C_TEXT : C_CYAN), 0);
+        if (used) {
+            // 有余量数据 → 克数(整卷克数 × 剩余百分比);整卷克数未知 → 百分比;
+            // 手动耗材/无 RFID 料卷 remain=-1 → 余量未知显示 "--"(材质与颜色照常显示)
+            if (slot->tray_pct >= 0)
+                snprintf(t, sizeof(t), slot->tray_weight > 0 ? "%dg" : "%d%%",
+                         slot->tray_weight > 0 ? slot->tray_remain : slot->tray_pct);
+            else
+                strcpy(t, "--");
+        } else {
             strcpy(t, "空槽");
+        }
         lv_label_set_text(s_ams_remain[ams_idx][i], t);
+
+        // 余量竖条按整卷百分比(0~100)填充:250g 小卷半满也显示半格,
+        // 不会像按"克/1000"那样几乎全空。低于 20% 转黄提醒。
+        int p = slot->tray_pct;
+        int gh = (p > 0) ? (p > 100 ? 52 : p * 52 / 100) : 0;
+        lv_obj_set_height(s_ams_gauge[ams_idx][i], gh);
+        lv_obj_align(s_ams_gauge[ams_idx][i], LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(s_ams_gauge[ams_idx][i],
+            lv_color_hex(p > 20 ? C_GREEN_L : (p > 0 ? C_YELLOW : C_LINE)), 0);
     }
 }
 
@@ -580,7 +680,7 @@ static void page_device_build(lv_obj_t *p)
     device_line(p, 150,"通行证电量", &s_d_bat);
 
     // HMS 告警面板
-    s_d_hms_panel = rect(p, 10, 182, 220, 92, 0x1A1418);
+    s_d_hms_panel = rect(p, 10, 170, 220, 72, 0x1A1418);
     lv_obj_set_style_radius(s_d_hms_panel, 6, 0);
     lv_obj_set_style_border_width(s_d_hms_panel, 1, 0);
     lv_obj_set_style_border_color(s_d_hms_panel, lv_color_hex(0x3A2226), 0);
@@ -593,13 +693,13 @@ static void page_device_build(lv_obj_t *p)
     // 固件版本(底部固定)
     lv_obj_t *ver = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text_fmt(ver, "bambumonitor v%s", FW_VERSION);
-    lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -2);
 }
 
 static void refresh_device(const bambu_state_t *st)
 {
     char t[40];
-    lv_label_set_text(s_d_sn, CFG_BAMBU_SERIAL);
+    lv_label_set_text(s_d_sn, app_mqtt_sn());
     snprintf(t, sizeof(t), "%d dBm", st->wifi_signal);
     lv_label_set_text(s_d_rssi, t);
 
@@ -701,10 +801,16 @@ static void ctl_refresh_items(const bambu_state_t *st)
             lv_color_hex(sel ? C_GREEN : C_LINE), 0);
     }
     if (s_stop_armed) {
+        int64_t left_us = 3 * 1000000LL - (esp_timer_get_time() - s_stop_armed_at);
+        if (left_us < 0) left_us = 0;
+        int sec = (int)((left_us + 999999) / 1000000);
         lv_label_set_text(s_ctl_labels[1], "再按确认停止!");
-        lv_label_set_text(s_ctl_state, "3 秒内再按 OK 执行停止");
+        lv_label_set_text_fmt(s_ctl_state, "再按 OK 停止 · 剩 %d 秒", sec);
+        lv_obj_set_width(s_ctl_arm_bar, (int)(left_us * 192 / (3 * 1000000LL)));
+        lv_obj_remove_flag(s_ctl_arm_bar, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_label_set_text(s_ctl_state, "上下选择 · OK 执行");
+        lv_obj_add_flag(s_ctl_arm_bar, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -729,6 +835,13 @@ static void page_control_build(lv_obj_t *p)
         lv_obj_align(s_ctl_labels[i], LV_ALIGN_LEFT_MID, 14, 0);
     }
 
+    // 停止二次确认倒计时条(3 秒窗口可视化)
+    lv_obj_t *arm_track = rect(p, 24, 176, 192, 6, C_LINE);
+    lv_obj_set_style_radius(arm_track, 3, 0);
+    s_ctl_arm_bar = rect(p, 24, 176, 0, 6, C_RED);
+    lv_obj_set_style_radius(s_ctl_arm_bar, 3, 0);
+    lv_obj_add_flag(s_ctl_arm_bar, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_t *hint = label(p, &font_zh14, 0x445262, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text(hint, "顶/底再按 = 翻页");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
@@ -738,7 +851,14 @@ static void page_control_build(lv_obj_t *p)
 
 static void refresh_header(const bambu_state_t *st)
 {
-    (void)st;
+    // 云/网络状态点:绿=云在线 黄=连接中 红=本机 WiFi 未连 灰=离线
+    uint32_t dc;
+    if (!app_wifi_connected())                    dc = C_RED;
+    else if (st->cloud == BAMBU_CLOUD_ONLINE)     dc = C_GREEN;
+    else if (st->cloud == BAMBU_CLOUD_CONNECTING) dc = C_YELLOW;
+    else                                          dc = C_DIM;
+    lv_obj_set_style_bg_color(s_cloud_dot, lv_color_hex(dc), 0);
+
     // 实时时钟(SNTP 未同步显示 --:--)
     if (app_wifi_time_ready()) {
         time_t now = time(NULL);
@@ -760,11 +880,20 @@ static void refresh_header(const bambu_state_t *st)
     }
 
     int soc = bsp_battery_soc();
+    int mv  = bsp_battery_mv();
+
+    // SOC 无效(多为 USB 供电无有效电量计读数)时,用电压线性估算兜底,避免常驻 “-”
+    if (soc < 0 && mv >= 3000 && mv <= 4300) {
+        int est = (mv - 3000) * 100 / (4200 - 3000);
+        if (est < 0) est = 0; else if (est > 100) est = 100;
+        soc = est;
+    }
+
     char t[8];
     snprintf(t, sizeof(t), "%d%%", soc);
     lv_label_set_text(s_bat_pct, soc >= 0 ? t : "-");
     uint32_t fc = soc > 50 ? C_GREEN : (soc > 20 ? C_YELLOW : C_RED);
-    lv_obj_set_width(s_bat_fill, soc * 20 / 100);   // 电池内部净宽 20
+    lv_obj_set_width(s_bat_fill, (soc < 0 ? 0 : soc) * 20 / 100);   // 电池内部净宽 20
     lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(fc), 0);
 }
 
@@ -773,14 +902,32 @@ static void refresh_all(void)
     bambu_state_t st;
     app_mqtt_snapshot(&st);
 
-    // 动态页数:2 固定 + AMS 台数(空闲时 report 不推 AMS 数据,ams_count=0 则不显示耗材页)
+    // 脏检查:快照没变、无交互、无倒计时,就只刷头部(时钟/电量/页点),不重排整页
+    bool changed = !s_prev_valid || memcmp(&s_prev, &st, sizeof(st)) != 0;
+    if (changed) { s_prev = st; s_prev_valid = true; }
+
+    // 动态页数:2 固定 + AMS 台数;已收到数据但 ams_count=0(外部料筒)也保留 1 页
     int ams_pages = st.ams_count;
     if (ams_pages > 4) ams_pages = 4;
-    s_pages_n = 2 + ams_pages + 2;     // = 2 + ams + 设备 + 控制
+    if (ams_pages == 0 && st.gcode_state[0]) ams_pages = 1;
+    // 导航序 → 实体槽位:进度/温度固定,AMS 只取前 ams_pages 个,设备/控制固定 6/7
+    {
+        int n = 0;
+        s_slot[n++] = 0;
+        s_slot[n++] = 1;
+        for (int i = 0; i < ams_pages; i++) s_slot[n++] = 2 + i;
+        s_slot[n++] = 6;                 // 设备页实体
+        s_slot[n++] = 7;                 // 控制页实体
+        s_pages_n = n;                   // = 2 + ams + 设备 + 控制
+    }
     if (s_cur >= s_pages_n) s_cur = s_pages_n - 1;
     if (s_cur < 0) s_cur = 0;
     int dev_idx = 2 + ams_pages;
     int ctl_idx = dev_idx + 1;
+
+    refresh_header(&st);
+    if (!changed && !s_dirty && !s_stop_armed) return;
+    s_dirty = false;
 
     // 状态切换提示音(完成/失败/暂停)
     if (s_last_state[0] && strcmp(s_last_state, st.gcode_state)) {
@@ -790,8 +937,7 @@ static void refresh_all(void)
     }
     strlcpy(s_last_state, st.gcode_state[0] ? st.gcode_state : "IDLE", sizeof(s_last_state));
 
-    refresh_header(&st);
-    refresh_hms_bar(&st);
+    refresh_status_bar(&st);
 
     switch (s_cur) {
     case 0: refresh_progress(&st); break;
@@ -828,13 +974,17 @@ static void show_page(int idx)
 {
     if (idx >= s_pages_n) idx = s_pages_n - 1;
     if (idx < 0) idx = 0;
+    // 导航序号 ≠ 实体槽位。实体固定为 0进度/1温度/2~5AMS/6设备/7控制,
+    // 而实际显示哪几页随 AMS 台数变化,必须经 s_slot 映射,否则 AMS 不足 4 台时
+    // 会翻到空 AMS 页,设备页/控制页反而永远翻不到。
+    int show = (idx >= 0 && idx < s_pages_n && idx < PAGE_MAX) ? s_slot[idx] : 0;
     for (int i = 0; i < PAGE_MAX; i++) {
-        if (i == idx) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-        else          lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+        if (i == show) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
     }
     s_cur = idx;
     s_stop_armed = false;   // 切页取消停止确认
-    refresh_all();
+    request_refresh();      // 延到 LVGL 任务里重绘(不在按键回调里干重活)
 }
 
 void app_printer_enter(void)
@@ -849,12 +999,12 @@ void app_printer_enter(void)
     lv_obj_set_style_pad_all(s_scr, 0, 0);
 
     header_build();
-    hms_bar_build();
+    status_bar_build();
     for (int i = 0; i < PAGE_MAX; i++) {
         s_pages[i] = lv_obj_create(s_scr);
         lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(s_pages[i], 0, 34);
-        lv_obj_set_size(s_pages[i], 240, 286);
+        lv_obj_set_pos(s_pages[i], 0, PAGE_Y);
+        lv_obj_set_size(s_pages[i], 240, PAGE_H);
         lv_obj_set_style_bg_opa(s_pages[i], LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(s_pages[i], 0, 0);
         lv_obj_set_style_pad_all(s_pages[i], 0, 0);
@@ -867,13 +1017,19 @@ void app_printer_enter(void)
 
     s_cur = 0;
     s_show_eta = false;
-    s_last_pct = -1;         // 强制首刷重画中心百分比
     s_ctl_sel = 0;
     s_stop_armed = false;
     s_light_on = false;
     s_last_state[0] = 0;
+    s_prev_valid = false;    // 重进页面时强制整页重绘
+    s_dirty = true;
     s_active = true;
     s_timer = lv_timer_create(tick_1s, 1000, NULL);
+    s_fast  = lv_timer_create(tick_fast, 30, NULL);   // 承接按键延后的重绘
+    s_slot[0] = 0; s_slot[1] = 1; s_slot[2] = 6; s_slot[3] = 7;  // 默认(还没 AMS 数据)
+    s_pages_n = 4;
+    s_need_refresh = false;
+    s_pk_valid = false;      // 丢弃进入前残留的按键
     show_page(0);
 
     lv_screen_load(s_scr);
@@ -892,28 +1048,33 @@ void app_printer_exit(void)
     if (!s_scr) return;
     s_active = false;
     if (s_timer) { lv_timer_delete(s_timer); s_timer = NULL; }
+    if (s_fast)  { lv_timer_delete(s_fast);  s_fast  = NULL; }
+    s_need_refresh = false;
+    s_pk_valid = false;
     lv_obj_delete(s_scr);
     s_scr = NULL;
     memset(s_pages, 0, sizeof(s_pages));
 }
 
-void app_printer_key(bsp_btn_t btn, bsp_btn_ev_t ev)
+// 真正的按键逻辑(只在 LVGL 任务里被调用,不在 button 小栈任务里跑)
+static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev)
 {
     if (!s_scr) return;
 
     if (ev == BSP_BTN_CLICK) {
+        s_dirty = true;      // 交互必重绘(数据可能没变,但选中项/显示模式变了)
         // 控制页:上下=选择,顶/底溢出=翻页;OK=执行
         bool in_ctl = (s_cur == s_pages_n - 1);
         if (btn == BSP_BTN_UP) {
             if (in_ctl) {
-                if (s_ctl_sel > 0) { s_ctl_sel--; refresh_all(); }
+                if (s_ctl_sel > 0) { s_ctl_sel--; request_refresh(); }
                 else show_page((s_cur + s_pages_n - 1) % s_pages_n);
             } else {
                 show_page((s_cur + s_pages_n - 1) % s_pages_n);
             }
         } else if (btn == BSP_BTN_DOWN) {
             if (in_ctl) {
-                if (s_ctl_sel < 2) { s_ctl_sel++; refresh_all(); }
+                if (s_ctl_sel < 2) { s_ctl_sel++; request_refresh(); }
                 else show_page((s_cur + 1) % s_pages_n);
             } else {
                 show_page((s_cur + 1) % s_pages_n);
@@ -948,4 +1109,11 @@ void app_printer_key(bsp_btn_t btn, bsp_btn_ev_t ev)
             }
         }
     }
+}
+
+// 对外入口:只记录按键,立刻返回 —— 绝不在 button 组件的小栈任务里干重活。
+void app_printer_key(bsp_btn_t btn, bsp_btn_ev_t ev)
+{
+    if (!s_scr) return;
+    s_pk_btn = btn; s_pk_ev = ev; s_pk_valid = true;
 }

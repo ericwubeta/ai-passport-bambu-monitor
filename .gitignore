@@ -4,7 +4,17 @@ sdkconfig.old
 managed_components/
 dependencies.lock
 .vscode/
+
+# 凭据(真实 WiFi/拓竹 token 不得入库;example 模板入库)
+*.bak
 main/secrets.h
+!main/secrets.h.example
+
+# 调试日志 / 串口抓取 / 临时探针
+*.log
+/probe.txt
+/build_v*_exit.txt
+
 # 构建产物 / 调试日志 / Python 缓存
 bambumonitor.bin
 build_log.txt

@@ -26,3 +26,9 @@ void demo_battery_key(bsp_btn_t btn, bsp_btn_ev_t ev);
 
 void demo_party_enter(void);    void demo_party_exit(void);
 void demo_party_key(bsp_btn_t btn, bsp_btn_ev_t ev);
+
+void demo_shengbei_enter(void);  void demo_shengbei_exit(void);
+void demo_shengbei_key(bsp_btn_t btn, bsp_btn_ev_t ev);
+
+void demo_weather_enter(void);   void demo_weather_exit(void);
+void demo_weather_key(bsp_btn_t btn, bsp_btn_ev_t ev);

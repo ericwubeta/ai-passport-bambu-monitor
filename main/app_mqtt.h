@@ -15,9 +15,15 @@ typedef enum {
 } bambu_cloud_t;
 
 typedef struct {
-    char      tray_type[8];    // PLA/PETG/...
+    char      tray_type[8];    // PLA/PETG/...(X1/P1)
+    char      tray_name[24];   // tray_id_name(X2D/AMS2 无 tray_type,料名/槽名)
     uint32_t  tray_color;      // 0xRRGGBB
-    int       tray_remain;     // 克
+    bool      color_valid;     // tray_color 有效(区分"无色"与纯黑 000000FF)
+    // 拓竹 ams tray 的 remain 是**剩余百分比(0~100)**,不是克;整卷克数在
+    // tray_weight(如 "1000")。空槽 remain = -1 且 tray_weight = "0"。
+    int       tray_pct;        // 剩余百分比 0~100;负数 = 空槽(无料卷)
+    int       tray_weight;     // 整卷标称克数(如 1000),0 = 未知
+    int       tray_remain;     // 剩余克数 = tray_weight * tray_pct / 100
     bool      is_used;         // 槽内有料(用于 2D 封面料斗 / 空槽置灰)
     bool      active;          // 当前打印正在使用的槽
 } bambu_tray_t;
@@ -25,6 +31,7 @@ typedef struct {
 typedef struct {
     bool present;              // 该 AMS 在位
     int  humidity;             // 干燥档 1..4(非百分比),-1=未知
+    int  humidity_raw;         // 湿度百分比(X2D/AMS2 报 humidity_raw,如 42)
     int  temp;                 // 料仓温度 ℃
     bambu_tray_t tray[BAMBU_TRAY_MAX];
 } bambu_ams_t;
@@ -69,6 +76,9 @@ void app_mqtt_snapshot(bambu_state_t *out);
 
 // 云连接已维持的秒数(设备页显示用)。
 int app_mqtt_uptime_sec(void);
+
+// 当前使用的打印机 SN(NVS 优先,回落 secrets.h),设备页显示用。
+const char *app_mqtt_sn(void);
 
 // 打印控制命令:cmd ∈ "pause" / "resume" / "stop"(QoS 1,发布到 request topic)。
 void app_mqtt_print_command(const char *cmd);

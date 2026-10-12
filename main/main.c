@@ -1,10 +1,10 @@
-// main/main.c —— AI 通行证固件入口:开机动画 → 打印机监控主界面;
-// 长按确定回到演示菜单(原 BSP 参考示例保留)。
+// main/main.c —— AI Passport 独立打印机固件入口:开机动画 → 直达拓竹状态屏。
+// 裁剪自多合一固件:仅保留打印机监控,长按确定回单页菜单。
 //
-// 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;打印机页=切换页面
-//   确定  短按   菜单中=进入选中项;打印机页=立即刷新
-//   确定  长按   任意页面=返回菜单
+// 按键语义(与主固件一致):
+//   上/下 短按   打印机页=切换页面(状态/温度/AMS/设备/控制)
+//   确定  短按   打印机页=立即刷新
+//   确定  长按   返回菜单(单页,再按确定回到打印机页)
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "bsp_button.h"
@@ -14,6 +14,7 @@
 #include "demo.h"
 #include "ui_pixel.h"
 #include "app_boot.h"
+#include "app_provision.h"
 #include "app_printer.h"
 #include "app_wifi.h"
 #include "app_mqtt.h"
@@ -23,18 +24,12 @@
 
 static const char *TAG = "main";
 
-// 打印机页作为第 0 项进入主流程;下面 4 项是原 BSP 演示。
 static const demo_entry_t DEMOS[] = {
-    { "打印机", app_printer_enter, app_printer_exit, app_printer_key },
-    { "显示",   demo_display_enter, demo_display_exit, demo_display_key },
-    { "按键",   demo_button_enter,  demo_button_exit,  demo_button_key  },
-    { "音频",   demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
-    { "电量",   demo_battery_enter, demo_battery_exit, demo_battery_key },
-    { "酒桌游戏", demo_party_enter, demo_party_exit, demo_party_key },
+    { "打印机", app_printer_enter,   app_printer_exit,   app_printer_key },
+    { "配网",   app_provision_enter, app_provision_exit, app_provision_key },
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
 static bool s_ok[DEMO_COUNT];
 
 static lv_obj_t *s_menu_scr;
@@ -43,7 +38,6 @@ static lv_obj_t *s_rows[DEMO_COUNT];
 static lv_obj_t *s_mascot;
 static int  s_sel;                 // 当前选中项
 static int  s_active = -1;         // 当前所在页面;-1 = 在菜单
-static bool s_in_printer = false;  // 主流程开机后直接进打印机页(不是经菜单进入)
 
 static void menu_refresh(void) {
     for (size_t i = 0; i < DEMO_COUNT; i++) {
@@ -59,18 +53,16 @@ static void menu_refresh(void) {
 static void menu_build(void) {
     s_menu_scr = ui_pixel_screen_create("AI 通行证");
 
-    // 5 张卡片:2 列 3 行紧凑排布,给吉祥物留出脚下草地
     for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 64;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 54, UI_PAPER);
+        int cy = 140 - (int)(DEMO_COUNT - 1) * 35 + (int)i * 70;   // 多项时竖排居中
+        s_cards[i] = ui_pixel_panel_create(s_menu_scr, 60, cy, 100, 46, UI_PAPER);
         s_rows[i] = lv_label_create(s_cards[i]);
         lv_obj_set_style_text_font(s_rows[i], &font_zh14, 0);
         lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_center(s_rows[i]);
     }
 
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 246);
+    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 286);
 
     menu_refresh();
     lv_screen_load(s_menu_scr);
@@ -78,7 +70,6 @@ static void menu_build(void) {
 
 static void enter_menu(void) {
     s_active = -1;
-    s_in_printer = false;
     menu_build();
 }
 
@@ -95,34 +86,35 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
             DEMOS[s_active].key(btn, ev);
         }
     } else if (ev == BSP_BTN_CLICK) {
-        if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh(); }
-        if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
         if (btn == BSP_BTN_OK && s_ok[s_sel]) {
             s_active = s_sel;
-            if (s_sel == 0) s_in_printer = true;
             ui_pixel_mascot_jump(s_mascot);
             lv_obj_delete(s_menu_scr);
             s_menu_scr = NULL;
             s_mascot = NULL;
             DEMOS[s_active].enter();
-        } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
-            ui_pixel_mascot_jump(s_mascot);
         }
     }
     bsp_lvgl_unlock();
 }
 
-// 开机动画结束回调(此时已持 LVGL 锁):起网络,进打印机主界面
+// 开机动画结束回调(此时已持 LVGL 锁):未配网→配网模式;已配置→联网直达打印机屏
 static void boot_done(void) {
+    if (app_provision_needed()) {
+        ESP_LOGW(TAG, "设备未配网,进入配网模式(热点 + 网页)");
+        app_provision_start();
+        s_active = 1;
+        DEMOS[1].enter();
+        return;
+    }
     app_wifi_start();
     app_mqtt_start();
     s_active = 0;
-    s_in_printer = true;
-    app_printer_enter();
+    DEMOS[0].enter();
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "AI Passport 打印机监控固件启动");
+    ESP_LOGI(TAG, "AI Passport 打印机固件启动");
 
     bsp_i2c_init();
     bsp_i2c_scan();
@@ -135,16 +127,12 @@ void app_main(void) {
     }
     bsp_display_backlight(100);
 
-    s_ok[0] = true;                                   // Printer 页始终可用
-    s_ok[1] = true;                                   // Display 已确认可用
-    s_ok[2] = (bsp_button_init(on_key, NULL) == ESP_OK);
-    s_ok[3] = (bsp_audio_init() == ESP_OK);
-    s_ok[4] = (bsp_battery_init() == ESP_OK);
-    s_ok[5] = s_ok[2];                       // 酒桌游戏依赖按键,复用按键初始化结果
+    s_ok[0] = (bsp_button_init(on_key, NULL) == ESP_OK);   // 页面导航依赖按键
+    bsp_audio_init();                                       // 提示音(完成/失败/HMS)
+    bsp_battery_init();                                     // 状态栏电量
 
     // 开机动画(拓竹 logo)→ 直接进打印机监控页
     if (bsp_lvgl_lock(1000)) { app_boot_show(boot_done); bsp_lvgl_unlock(); }
 
-    ESP_LOGI(TAG, "就绪:Button=%d Audio=%d Battery=%d",
-             s_ok[2], s_ok[3], s_ok[4]);
+    ESP_LOGI(TAG, "就绪:Button=%d", s_ok[0]);
 }
