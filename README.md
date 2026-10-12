@@ -12,10 +12,23 @@ It subscribes to the Bambu Cloud MQTT stream and shows live print status, temper
 - **AMS filament** — up to 4 AMS × 4 slots: material, color, name and remaining grams (manual spools without RFID are handled correctly)
 - **HMS alerts** — error codes shown in the status bar with a notification sound
 - **Device page** — printer model, serial, firmware and connection state
-- **Control page** — pause / resume / stop the job and toggle the chamber light through the cloud channel
+- **Control page** — sends pause/resume/stop and chamber-light commands through the cloud channel (whether the printer executes them depends on the account; third-party tokens are typically read-only)
 - **On-device provisioning** — softAP + web page; Wi-Fi and Bambu credentials are stored in NVS, never compiled in
 - **Cyber boot animation** — terminal-style boot log drawn entirely with LVGL primitives
 - ~10 s telemetry refresh, heap-stable for days of continuous monitoring
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/images/hero-progress.jpg" width="400" alt="Print progress page on the wearable badge">
+</p>
+<p align="center">
+  <em>Print progress: state, temperatures, layers, remaining time</em>
+</p>
+
+| AMS filament slots | Print control | Boot animation |
+| :---: | :---: | :---: |
+| <img src="docs/images/page-ams.jpg" width="240"> | <img src="docs/images/page-control.jpg" width="240"> | <img src="docs/images/boot.jpg" width="240"> |
 
 ## Hardware
 

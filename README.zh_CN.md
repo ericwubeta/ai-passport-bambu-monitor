@@ -12,10 +12,23 @@ English | [简体中文](README.zh_CN.md)
 - **AMS 料槽**：最多 4 台 AMS × 4 槽，显示材质、颜色、料名与剩余克数（正确处理无 RFID 的手动耗材）
 - **HMS 告警**：错误码显示在常驻状态条并播放提示音
 - **设备页**：打印机型号、序列号、固件版本与连接状态
-- **控制页**：通过云端通道暂停 / 继续 / 停止打印、切换腔体灯
+- **控制页**：通过云端通道下发暂停 / 继续 / 停止 / 腔灯指令（打印机是否执行取决于账号权限，第三方 token 通常为只读）
 - **设备端配网**：热点 + 网页配置，WiFi 与拓竹凭据只存 NVS，不编进固件
 - **赛博开机动画**：终端风格逐字启动日志，纯 LVGL 图元绘制
 - 约 10 秒刷新一次遥测，堆内存稳定，可连续监控数日
+
+## 效果截图
+
+<p align="center">
+  <img src="docs/images/hero-progress.jpg" width="400" alt="随身牌上的打印进度页">
+</p>
+<p align="center">
+  <em>打印进度:状态、温度、层数、剩余时间</em>
+</p>
+
+| AMS 料槽 | 打印控制 | 开机动画 |
+| :---: | :---: | :---: |
+| <img src="docs/images/page-ams.jpg" width="240"> | <img src="docs/images/page-control.jpg" width="240"> | <img src="docs/images/boot.jpg" width="240"> |
 
 ## 硬件
 
