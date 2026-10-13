@@ -14,6 +14,7 @@ It subscribes to the Bambu Cloud MQTT stream and shows live print status, temper
 - **Device page** — printer model, serial, firmware and connection state
 - **Control page** — sends pause/resume/stop and chamber-light commands through the cloud channel (whether the printer executes them depends on the account; third-party tokens are typically read-only)
 - **On-device provisioning** — softAP + web page; Wi-Fi and Bambu credentials are stored in NVS, never compiled in
+- **Multi-printer** — monitor up to 4 printers on the same Bambu account via a card overview with per-printer detail pages (testing status below)
 - **Cyber boot animation** — terminal-style boot log drawn entirely with LVGL primitives
 - ~10 s telemetry refresh, heap-stable for days of continuous monitoring
 
@@ -77,6 +78,29 @@ compile-time defaults.
 > expires periodically. Re-provision when the cloud indicator stays
 > disconnected. Only flash firmware containing your own token to devices you
 > own.
+
+## Multi-printer support & testing status
+
+Up to **4 printers on the same Bambu account** can be monitored at once:
+
+- The provisioning page accepts 2–4 serial numbers with optional custom names (e.g. `Study X1C`)
+- With 2+ printers configured, the device opens a **printer overview** (each card shows name, state dot, progress % and remaining time; printers with HMS alarms are highlighted) — press OK to open a printer's detail pages, long-press OK to return to the overview
+- With exactly 1 printer the behaviour is identical to the single-printer firmware
+- All printers share one cloud connection (single TLS/MQTT session, one report topic per printer)
+
+**Testing status — please read before relying on this feature:**
+
+| Scenario | Status |
+| --- | --- |
+| Single printer (regression) | ✅ Verified on hardware, long-run stable, watchdog-free |
+| Multi-printer UI, navigation, per-printer data routing | ✅ Verified on hardware in **simulation** (1 real printer + 3 injected test serial numbers) |
+| Real data while subscribed to 4 topics at once | ✅ Verified on hardware |
+| **Two or more *real* printers streaming simultaneously** | ⚠️ **Not tested** — the author only owns one printer. The topic routing is standard MQTT, but this scenario has no hardware confirmation yet |
+| Provisioning page with multiple serial numbers | ⚠️ Form parsing code-reviewed, not end-to-end tested on hardware |
+
+For testing without extra hardware, `main/app_mqtt.c` has a simulation switch: set `TEST_EXTRA_MACHINES` to 1/2/3 to inject that many fake printers next to the real one. **It defaults to 0 (off) and must stay 0 in release builds.**
+
+If you run two or more real printers and hit an issue, please open an issue — real multi-printer feedback is very welcome.
 
 ## Building
 
