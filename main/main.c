@@ -80,6 +80,13 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
 
     if (s_active >= 0) {
         if (btn == BSP_BTN_OK && ev == BSP_BTN_LONG) {     // 统一返回
+            // 打印机页多机概览时,长按 OK 先被 app_printer 内部消化
+            // (详情→概览);只有已在概览页才真正退出到菜单。
+            if (s_active == 0 && app_mqtt_machine_count() >= 2 && !app_printer_in_overview()) {
+                DEMOS[s_active].key(btn, ev);   // 交回打印机页:返回机器列表
+                bsp_lvgl_unlock();
+                return;
+            }
             DEMOS[s_active].exit();
             enter_menu();
         } else {

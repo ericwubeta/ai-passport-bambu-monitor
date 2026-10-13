@@ -46,13 +46,21 @@ static const char *PAGE_HTML =
 "background:#00c853;color:#fff;font-size:16px}"
 "</style></head><body>"
 "<h2>拓竹监视器 · 配网</h2>"
-"<p>填入家里 WiFi 与拓竹账号。Token 在电脑跑 weblogin.py 登录后复制。</p>"
+"<p>填入家里 WiFi 与拓竹账号,再逐台添加打印机(同一账号最多 4 台,可起名字)。"
+"Token 在电脑跑 weblogin.py 登录后复制。</p>"
 "<form method='post' action='/save'>"
 "<label>WiFi 名称</label><input name='ssid' required>"
 "<label>WiFi 密码</label><input name='pass' type='password' required>"
 "<label>拓竹 User ID(纯数字)</label><input name='uid' required>"
 "<label>拓竹 Token(accessToken)</label><input name='token' required>"
-"<label>打印机 SN</label><input name='sn' required>"
+"<label>1号机 名称(可空,如:书房X1C)</label><input name='name1' maxlength='16'>"
+"<label>1号机 序列号</label><input name='sn1' required>"
+"<label>2号机 名称(可空)</label><input name='name2' maxlength='16'>"
+"<label>2号机 序列号(没第2台留空)</label><input name='sn2'>"
+"<label>3号机 名称(可空)</label><input name='name3' maxlength='16'>"
+"<label>3号机 序列号(没第3台留空)</label><input name='sn3'>"
+"<label>4号机 名称(可空)</label><input name='name4' maxlength='16'>"
+"<label>4号机 序列号(没第4台留空)</label><input name='sn4'>"
 "<button>保存并重启</button></form></body></html>";
 
 static const char *SAVED_HTML =
@@ -133,19 +141,26 @@ static esp_err_t save_handler(httpd_req_t *req)
     form_field(buf, "pass",  cfg.wifi_pass,   sizeof(cfg.wifi_pass));
     form_field(buf, "uid",   cfg.bambu_uid,   sizeof(cfg.bambu_uid));
     form_field(buf, "token", cfg.bambu_token, sizeof(cfg.bambu_token));
-    form_field(buf, "sn",    cfg.bambu_sn,    sizeof(cfg.bambu_sn));
+    // 多机:sn1..sn4 / name1..name4(1 号机必填,其余可空)
+    for (int i = 0; i < CFG_MACHINE_MAX; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "sn%d", i + 1);
+        form_field(buf, key, cfg.bambu_sn[i], sizeof(cfg.bambu_sn[i]));
+        snprintf(key, sizeof(key), "name%d", i + 1);
+        form_field(buf, key, cfg.bambu_name[i], sizeof(cfg.bambu_name[i]));
+    }
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     if (!cfg.wifi_ssid[0] || !cfg.wifi_pass[0] || !cfg.bambu_uid[0] ||
-        !cfg.bambu_token[0] || !cfg.bambu_sn[0]) {
+        !cfg.bambu_token[0] || !cfg.bambu_sn[0][0]) {
         httpd_resp_send(req, "有必填项为空,请返回补全再提交", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 
     bool ok = config_save(&cfg);
     if (ok) config_mark_provisioned();
-    ESP_LOGI(TAG, "配置保存%s: ssid=%s uid=%s sn=%s", ok ? "成功" : "失败",
-             cfg.wifi_ssid, cfg.bambu_uid, cfg.bambu_sn);
+    ESP_LOGI(TAG, "配置保存%s: ssid=%s uid=%s 机器=%d 台", ok ? "成功" : "失败",
+             cfg.wifi_ssid, cfg.bambu_uid, config_machine_count(&cfg));
 
     if (!ok) {
         httpd_resp_send(req, "NVS 写入失败,请重试", HTTPD_RESP_USE_STRLEN);
@@ -193,7 +208,7 @@ bool app_provision_needed(void)
 {
     device_config_t cfg;
     if (!config_load(&cfg)) return true;
-    if (cfg.wifi_ssid[0] && cfg.bambu_uid[0] && cfg.bambu_token[0] && cfg.bambu_sn[0])
+    if (cfg.wifi_ssid[0] && cfg.bambu_uid[0] && cfg.bambu_token[0] && cfg.bambu_sn[0][0])
         return false;                                       // NVS 已配好
     // NVS 未配,但 secrets.h 有真值(老机器兼容,刷了硬编码版的直接用)
     if (strncmp(CFG_WIFI_SSID, "YOUR_", 5) != 0 &&

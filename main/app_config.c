@@ -40,7 +40,21 @@ bool config_load(device_config_t *cfg) {
     n = sizeof(cfg->wifi_pass);   nvs_get_str(s_handle, "wifi_pass",  cfg->wifi_pass,  &n);
     n = sizeof(cfg->bambu_uid);   nvs_get_str(s_handle, "bambu_uid",  cfg->bambu_uid,  &n);
     n = sizeof(cfg->bambu_token); nvs_get_str(s_handle, "bambu_token", cfg->bambu_token, &n);
-    n = sizeof(cfg->bambu_sn);    nvs_get_str(s_handle, "bambu_sn",    cfg->bambu_sn,    &n);
+
+    // 打印机列表:sn0..sn3 / name0..name3。兼容旧单机数据:bambu_sn 单键 → 槽 0。
+    for (int i = 0; i < CFG_MACHINE_MAX; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "sn%d", i);
+        n = sizeof(cfg->bambu_sn[i]);
+        nvs_get_str(s_handle, key, cfg->bambu_sn[i], &n);
+        snprintf(key, sizeof(key), "nm%d", i);
+        n = sizeof(cfg->bambu_name[i]);
+        nvs_get_str(s_handle, key, cfg->bambu_name[i], &n);
+    }
+    if (!cfg->bambu_sn[0][0]) {   // 老数据迁移
+        n = sizeof(cfg->bambu_sn[0]);
+        nvs_get_str(s_handle, "bambu_sn", cfg->bambu_sn[0], &n);
+    }
     return true;
 }
 
@@ -51,10 +65,26 @@ bool config_save(const device_config_t *cfg) {
     ok &= (nvs_set_str(s_handle, "wifi_pass",  cfg->wifi_pass)  == ESP_OK);
     ok &= (nvs_set_str(s_handle, "bambu_uid",  cfg->bambu_uid)  == ESP_OK);
     ok &= (nvs_set_str(s_handle, "bambu_token", cfg->bambu_token) == ESP_OK);
-    ok &= (nvs_set_str(s_handle, "bambu_sn",    cfg->bambu_sn)    == ESP_OK);
+    for (int i = 0; i < CFG_MACHINE_MAX; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "sn%d", i);
+        ok &= (nvs_set_str(s_handle, key, cfg->bambu_sn[i]) == ESP_OK);
+        snprintf(key, sizeof(key), "nm%d", i);
+        ok &= (nvs_set_str(s_handle, key, cfg->bambu_name[i]) == ESP_OK);
+    }
+    // 兼容键同步到槽 0,老固件回读不丢
+    ok &= (nvs_set_str(s_handle, "bambu_sn", cfg->bambu_sn[0]) == ESP_OK);
     ok &= (nvs_commit(s_handle) == ESP_OK);
     if (!ok) ESP_LOGE(TAG, "config_save 部分写入失败");
     return ok;
+}
+
+int config_machine_count(const device_config_t *cfg) {
+    if (!cfg) return 0;
+    int cnt = 0;
+    for (int i = 0; i < CFG_MACHINE_MAX; i++)
+        if (cfg->bambu_sn[i][0]) cnt++;
+    return cnt;
 }
 
 bool config_is_provisioned(void) {

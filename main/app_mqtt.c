@@ -28,38 +28,55 @@ static const char *TAG = "app_mqtt";
 
 static esp_mqtt_client_handle_t s_cli;
 static SemaphoreHandle_t s_lock;
-static bambu_state_t s_state;
+static bambu_state_t s_state[BAMBU_MACHINE_MAX];   // 每台机器独立状态槽
 static int64_t s_conn_since;      // 云连接建立的时间戳(us)
-static bool s_ever_data;
+static bool s_ever_data[BAMBU_MACHINE_MAX];
 
 // 凭据:NVS(配网写入)优先,空则回落 secrets.h。app_mqtt_start 时解析一次。
 static char s_uid[40];            // "u_<USER_ID>"
 static char s_tok[260];           // accessToken
-static char s_sn[34];             // 打印机序列号
+static char s_sn[BAMBU_MACHINE_MAX][34];   // 各打印机序列号
+static char s_name[BAMBU_MACHINE_MAX][17]; // 自定义名称(可空)
+static int  s_mcount;             // 有效机器数 1..4
 
-static const char *sn(void) { return s_sn[0] ? s_sn : CFG_BAMBU_SERIAL; }
+static const char *sn_at(int i) { return s_sn[i]; }
+
+// topic → 机器下标:device/<SN>/report 形态,匹配配置的 SN 列表
+static int idx_from_topic(const char *topic, int tlen)
+{
+    const char *p = strstr(topic, "device/");
+    if (!p) return -1;
+    p += 7;
+    const char *slash = memchr(p, '/', (size_t)(topic + tlen - p));
+    int snlen = slash ? (int)(slash - p) : (int)(topic + tlen - p);
+    for (int i = 0; i < s_mcount; i++) {
+        if ((int)strlen(s_sn[i]) == snlen && !strncmp(s_sn[i], p, (size_t)snlen))
+            return i;
+    }
+    return -1;
+}
 
 // ---------------------------------------------------------------- 工具
 
-static void state_reset_online_part(void)
+static void state_reset_online_part(bambu_state_t *st)
 {
-    s_state.gcode_state[0] = 0;
-    s_state.pct = 0;
-    s_state.remain_min = 0;
-    s_state.layer = s_state.total_layer = 0;
-    s_state.nozzle_t = s_state.nozzle_target = 0;
-    s_state.bed_t = s_state.bed_target = 0;
-    s_state.chamber_t = 0;
-    s_state.fan_cooling_pct = 0;
-    s_state.spd_lvl = 0;
-    s_state.wifi_signal = 0;
-    s_state.job[0] = 0;
-    s_state.printer_ip = 0;
-    s_state.ams_count = 0;
-    s_state.ams_active = false;
-    memset(s_state.ams, 0, sizeof(s_state.ams));
-    s_state.hms_count = 0;
-    memset(s_state.hms, 0, sizeof(s_state.hms));
+    st->gcode_state[0] = 0;
+    st->pct = 0;
+    st->remain_min = 0;
+    st->layer = st->total_layer = 0;
+    st->nozzle_t = st->nozzle_target = 0;
+    st->bed_t = st->bed_target = 0;
+    st->chamber_t = 0;
+    st->fan_cooling_pct = 0;
+    st->spd_lvl = 0;
+    st->wifi_signal = 0;
+    st->job[0] = 0;
+    st->printer_ip = 0;
+    st->ams_count = 0;
+    st->ams_active = false;
+    memset(st->ams, 0, sizeof(st->ams));
+    st->hms_count = 0;
+    memset(st->hms, 0, sizeof(st->hms));
 }
 
 // 任务名保留 UTF-8(中文字体已嵌入):只剥掉控制字符,截断时保证
@@ -313,8 +330,9 @@ static bool jstr(const char *v, const char *ve, char *out, int n)
         if (_v) (dst) = jint(_v, _e, (dst)); \
     } while (0)
 
-static void parse_report(const char *data, int len)
+static void parse_report(int idx, const char *data, int len)
 {
+    bambu_state_t *const st = &s_state[idx];
     // X2D 全量快照(含 AMS/2D 信息)可达 10~15KB,buffer 已配 20KB。
     // 轻量扫描不建树,内存 O(1),不受堆限制。
     if (len > 18 * 1024) return;
@@ -331,58 +349,58 @@ static void parse_report(const char *data, int len)
         if (v) {
             char gs[10];
             if (jstr(v, ve, gs, sizeof(gs))) {
-                bool changed = strcmp(s_state.gcode_state, gs) != 0;
-                strlcpy(s_state.gcode_state, gs, sizeof(s_state.gcode_state));
+                bool changed = strcmp(st->gcode_state, gs) != 0;
+                strlcpy(st->gcode_state, gs, sizeof(st->gcode_state));
                 // 状态切换到 IDLE / FINISH / FAILED 且不再是打印中:
                 // 清空残留的旧进度/层数/温度/任务,避免界面出现"空闲 + 53%"这种矛盾。
                 if (changed && (strcmp(gs, "IDLE") == 0 || strcmp(gs, "FINISH") == 0 ||
                                 strcmp(gs, "FAILED") == 0)) {
-                    s_state.pct = 0;
-                    s_state.remain_min = 0;
-                    s_state.layer = 0;
-                    s_state.total_layer = 0;
-                    s_state.nozzle_t = 0;
-                    s_state.nozzle_target = 0;
-                    s_state.bed_t = 0;
-                    s_state.bed_target = 0;
-                    s_state.chamber_t = 0;
-                    s_state.job[0] = 0;
+                    st->pct = 0;
+                    st->remain_min = 0;
+                    st->layer = 0;
+                    st->total_layer = 0;
+                    st->nozzle_t = 0;
+                    st->nozzle_target = 0;
+                    st->bed_t = 0;
+                    st->bed_target = 0;
+                    st->chamber_t = 0;
+                    st->job[0] = 0;
                 }
             }
         }
 
         // 增量推送:报文里出现字段才更新,否则保留旧值,避免温度/进度被清零。
-        JUPDATE_INT(pr, plen, "mc_percent", s_state.pct);
-        JUPDATE_INT(pr, plen, "mc_remaining_time", s_state.remain_min);
-        JUPDATE_INT(pr, plen, "layer_num", s_state.layer);
-        JUPDATE_INT(pr, plen, "total_layer_num", s_state.total_layer);
+        JUPDATE_INT(pr, plen, "mc_percent", st->pct);
+        JUPDATE_INT(pr, plen, "mc_remaining_time", st->remain_min);
+        JUPDATE_INT(pr, plen, "layer_num", st->layer);
+        JUPDATE_INT(pr, plen, "total_layer_num", st->total_layer);
         // 温度字段不同型号有不同命名,两种都试
-        JUPDATE_INT2(pr, plen, "nozzle_temper", "nozzle_temperature", s_state.nozzle_t);
-        JUPDATE_INT2(pr, plen, "nozzle_target_temper", "nozzle_target_temperature", s_state.nozzle_target);
-        JUPDATE_INT2(pr, plen, "bed_temper", "bed_temperature", s_state.bed_t);
-        JUPDATE_INT2(pr, plen, "bed_target_temper", "bed_target_temperature", s_state.bed_target);
+        JUPDATE_INT2(pr, plen, "nozzle_temper", "nozzle_temperature", st->nozzle_t);
+        JUPDATE_INT2(pr, plen, "nozzle_target_temper", "nozzle_target_temperature", st->nozzle_target);
+        JUPDATE_INT2(pr, plen, "bed_temper", "bed_temperature", st->bed_t);
+        JUPDATE_INT2(pr, plen, "bed_target_temper", "bed_target_temperature", st->bed_target);
         // 腔温:X2D 实测字段为 print.device.ctc.info.temp(CTC=腔温控制,藏于 device 子对象,
         // print 一层枚举不到);老机型为 print 一层 chamber_temper,H2D 另有 ctc_info.temp
         JUPDATE_INT4(pr, plen, "device.ctc.info.temp", "ctc_info.temp",
-                     "chamber_temper", "chamber_temperature", s_state.chamber_t);
+                     "chamber_temper", "chamber_temperature", st->chamber_t);
         // 风扇:原始值 0~15,存成百分比;字段缺失时反算原值再更新,保证幂等
         {
-            int fan_raw = s_state.fan_cooling_pct * 15 / 100;
+            int fan_raw = st->fan_cooling_pct * 15 / 100;
             JUPDATE_INT(pr, plen, "cooling_fan_speed", fan_raw);
-            s_state.fan_cooling_pct = fan_raw * 100 / 15;
+            st->fan_cooling_pct = fan_raw * 100 / 15;
         }
-        JUPDATE_INT(pr, plen, "spd_lvl", s_state.spd_lvl);
-        JUPDATE_INT(pr, plen, "wifi_signal", s_state.wifi_signal);
+        JUPDATE_INT(pr, plen, "spd_lvl", st->spd_lvl);
+        JUPDATE_INT(pr, plen, "wifi_signal", st->wifi_signal);
 
         v = jpath(pr, plen, "subtask_name", &ve);
         if (!v) v = jpath(pr, plen, "gcode_file", &ve);   // X2D 部分固件用 gcode_file
         if (v) {
             char jb[64];
-            if (jstr(v, ve, jb, sizeof(jb))) sanitize_job(jb, s_state.job, sizeof(s_state.job));
+            if (jstr(v, ve, jb, sizeof(jb))) sanitize_job(jb, st->job, sizeof(st->job));
         }
 
         v = jpath(pr, plen, "net.info[0].ip", &ve);
-        if (v) s_state.printer_ip = jint(v, ve, 0);
+        if (v) st->printer_ip = jint(v, ve, 0);
 
         // ---------- AMS:只在报文携带 AMS 数据时刷新 ----------
         // 增量 push_status 报文没有 AMS 段;若无条件清零,AMS 页会在增量到达时
@@ -397,9 +415,9 @@ static void parse_report(const char *data, int len)
             v = jpath(pr, plen, "ams.tray_now", &ve);
             if (v) tray_now = jint(v, ve, 255);   // jint 已兼容字符串/数字两种值
 
-            memset(s_state.ams, 0, sizeof(s_state.ams));
-            s_state.ams_count = 0;
-            s_state.ams_active = false;
+            memset(st->ams, 0, sizeof(st->ams));
+            st->ams_count = 0;
+            st->ams_active = false;
 
             for (int i = 0; i < BAMBU_AMS_MAX; i++) {
                 char path[24];
@@ -414,7 +432,7 @@ static void parse_report(const char *data, int len)
                 if (!au || au >= ae) break;
                 int alen = (int)(ae - au);
 
-                bambu_ams_t *a = &s_state.ams[i];
+                bambu_ams_t *a = &st->ams[i];
                 v = jpath(au, alen, "humidity", &ve);     if (v) a->humidity = jint(v, ve, -1);
                 v = jpath(au, alen, "humidity_raw", &ve); if (v) a->humidity_raw = jint(v, ve, 0);
                 v = jpath(au, alen, "temp", &ve);         if (v) a->temp = jint(v, ve, 0);
@@ -469,26 +487,26 @@ static void parse_report(const char *data, int len)
                 // 在位判定:有料槽数据或湿度/温度读数才计入(拓竹 ams.ams 数组常
                 // 固定 4 个元素,未接的 AMS 是空壳,不能算在位,否则 UI 显示 4 台)
                 a->present = (used_slots > 0) || (a->humidity > 0) || (a->temp > 0);
-                if (a->present) s_state.ams_count = i + 1;
+                if (a->present) st->ams_count = i + 1;
             }
 
                 // tray_now 是全局槽号(AMS1=0..3,AMS2=4..7),据此标记活动槽
                 if (tray_now >= 0 && tray_now < BAMBU_AMS_MAX * BAMBU_TRAY_MAX) {
                     int ai = tray_now / BAMBU_TRAY_MAX, ti = tray_now % BAMBU_TRAY_MAX;
-                    if (ai < s_state.ams_count && s_state.ams[ai].present) {
-                        s_state.ams[ai].tray[ti].active = true;
-                        s_state.ams_active = true;
+                    if (ai < st->ams_count && st->ams[ai].present) {
+                        st->ams[ai].tray[ti].active = true;
+                        st->ams_active = true;
                     }
                 }
             }   // if (has_ams)
 
             // 无 AMS → 退回外部料筒 vt_tray,塞进 ams[0] 并标记 present=false 便于 UI 区分
-            if (s_state.ams_count == 0) {
+            if (st->ams_count == 0) {
                 const char *vte = NULL;
                 const char *vt = jpath(pr, plen, "vt_tray", &vte);
                 if (vt && vt < vte) {
                     int vtlen = (int)(vte - vt);
-                    bambu_ams_t *a = &s_state.ams[0];
+                    bambu_ams_t *a = &st->ams[0];
                     a->present = false;                 // 表示"外部料筒"
                     a->humidity = -1;
                     char type[8], color[12];
@@ -514,8 +532,8 @@ static void parse_report(const char *data, int len)
                     }
                     a->tray[0].is_used = true;
                     a->tray[0].active = true;
-                    s_state.ams_count = 1;
-                    s_state.ams_active = false;
+                    st->ams_count = 1;
+                    st->ams_active = false;
                 }
             }
         }
@@ -526,7 +544,7 @@ static void parse_report(const char *data, int len)
             const char *he = NULL;
             const char *hms = jpath(pr, plen, "hms", &he);
             if (hms && hms < he) {
-                s_state.hms_count = 0;
+                st->hms_count = 0;
                 const char *hp = jskip_ws(hms, he);
                 bool is_arr = (hp < he && *hp == '[');
                 for (int i = 0; i < BAMBU_HMS_MAX; i++) {
@@ -551,14 +569,14 @@ static void parse_report(const char *data, int len)
                         }
                     }
                     if (code) {
-                        s_state.hms[s_state.hms_count].code = code;
-                        s_state.hms_count++;
+                        st->hms[st->hms_count].code = code;
+                        st->hms_count++;
                     }
                 }
             }
         }
 
-        s_ever_data = true;
+        s_ever_data[idx] = true;
         xSemaphoreGive(s_lock);
     }
 
@@ -569,30 +587,30 @@ static void parse_report(const char *data, int len)
         if (now - s_last_summary > 10 * 1000000) {
             s_last_summary = now;
             ESP_LOGI(TAG,
-                     "摘要: state=%s pct=%d%% nz=%d/%d bed=%d/%d cham=%d ams=%d hms=%d "
+                     "m%d 摘要: state=%s pct=%d%% nz=%d/%d bed=%d/%d cham=%d ams=%d hms=%d "
                      "(A0 h=%d/%d u=%d) (A1 h=%d/%d u=%d) (A2 h=%d/%d u=%d) (A3 h=%d/%d u=%d) "
                      "job=%s heap=%d",
-                     s_state.gcode_state, s_state.pct,
-                     s_state.nozzle_t, s_state.nozzle_target,
-                     s_state.bed_t, s_state.bed_target,
-                     s_state.chamber_t,
-                     s_state.ams_count, s_state.hms_count,
-                     s_state.ams[0].humidity, s_state.ams[0].humidity_raw, s_state.ams[0].tray[0].is_used,
-                     s_state.ams[1].humidity, s_state.ams[1].humidity_raw, s_state.ams[1].tray[0].is_used,
-                     s_state.ams[2].humidity, s_state.ams[2].humidity_raw, s_state.ams[2].tray[0].is_used,
-                     s_state.ams[3].humidity, s_state.ams[3].humidity_raw, s_state.ams[3].tray[0].is_used,
-                     s_state.job, (int)esp_get_free_heap_size());
+                     idx, st->gcode_state, st->pct,
+                     st->nozzle_t, st->nozzle_target,
+                     st->bed_t, st->bed_target,
+                     st->chamber_t,
+                     st->ams_count, st->hms_count,
+                     st->ams[0].humidity, st->ams[0].humidity_raw, st->ams[0].tray[0].is_used,
+                     st->ams[1].humidity, st->ams[1].humidity_raw, st->ams[1].tray[0].is_used,
+                     st->ams[2].humidity, st->ams[2].humidity_raw, st->ams[2].tray[0].is_used,
+                     st->ams[3].humidity, st->ams[3].humidity_raw, st->ams[3].tray[0].is_used,
+                     st->job, (int)esp_get_free_heap_size());
         }
     }
 }
 
 // ---------------------------------------------------------------- 事件
 
-static void push_pushall(void)
+static void push_pushall(int idx)
 {
-    if (!s_cli) return;
+    if (!s_cli || idx < 0 || idx >= s_mcount) return;
     char topic[48], payload[40];
-    snprintf(topic, sizeof(topic), "device/%s/request", sn());
+    snprintf(topic, sizeof(topic), "device/%s/request", sn_at(idx));
     snprintf(payload, sizeof(payload), "{\"pushing\":{\"command\":\"pushall\"}}");
     esp_mqtt_client_publish(s_cli, topic, payload, 0, 0, 0);
 }
@@ -602,35 +620,38 @@ static void on_mqtt(void *handler_arg, esp_event_base_t base, int32_t id, void *
     esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)data;
     switch ((esp_mqtt_event_id_t)id) {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "拓竹云已连接");
+        ESP_LOGI(TAG, "拓竹云已连接(机器数=%d)", s_mcount);
         s_conn_since = esp_timer_get_time();
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            s_state.cloud = BAMBU_CLOUD_ONLINE;
+            for (int i = 0; i < s_mcount; i++) s_state[i].cloud = BAMBU_CLOUD_ONLINE;
             xSemaphoreGive(s_lock);
         }
-        // 订阅/printer/上报 topic,否则收不到打印机的 report 推送
-        {
+        // 每台机器各订阅 report topic,否则收不到推送
+        for (int i = 0; i < s_mcount; i++) {
             char rt[48];
-            snprintf(rt, sizeof(rt), "device/%s/report", sn());
+            snprintf(rt, sizeof(rt), "device/%s/report", sn_at(i));
             esp_mqtt_client_subscribe(s_cli, rt, 0);
             ESP_LOGI(TAG, "已订阅 %s", rt);
+            push_pushall(i);
         }
-        push_pushall();
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "拓竹云断开,自动重连");
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-            s_state.cloud = BAMBU_CLOUD_CONNECTING;
+            for (int i = 0; i < s_mcount; i++) s_state[i].cloud = BAMBU_CLOUD_CONNECTING;
             xSemaphoreGive(s_lock);
         }
         break;
-    case MQTT_EVENT_DATA:
+    case MQTT_EVENT_DATA: {
         // 诊断:大报文在 esp-mqtt 里可能分段回调(total_data_len>data_len)
         if (e->total_data_len != e->data_len)
             ESP_LOGW(TAG, ">>> MQTT 分段: data_len=%d total=%d off=%d",
                      e->data_len, e->total_data_len, e->current_data_offset);
-        parse_report(e->data, e->data_len);
+        // 按 topic 里的 SN 路由到对应机器的解析槽
+        int idx = idx_from_topic(e->topic, e->topic_len);
+        if (idx >= 0) parse_report(idx, e->data, e->data_len);
         break;
+    }
     default:
         break;
     }
@@ -638,7 +659,7 @@ static void on_mqtt(void *handler_arg, esp_event_base_t base, int32_t id, void *
 
 static void push_timer_cb(void *arg)
 {
-    push_pushall();
+    for (int i = 0; i < s_mcount; i++) push_pushall(i);
 }
 
 // ---------------------------------------------------------------- API
@@ -646,8 +667,10 @@ static void push_timer_cb(void *arg)
 void app_mqtt_start(void)
 {
     s_lock = xSemaphoreCreateMutex();
-    state_reset_online_part();
-    s_state.cloud = BAMBU_CLOUD_OFF;
+    for (int i = 0; i < BAMBU_MACHINE_MAX; i++) {
+        state_reset_online_part(&s_state[i]);
+        s_state[i].cloud = BAMBU_CLOUD_OFF;
+    }
 
     // 凭据解析:NVS 优先,空则回落 secrets.h(老机器兼容)。
     device_config_t cfgc;
@@ -663,8 +686,34 @@ void app_mqtt_start(void)
     }
     if (cfgc.bambu_token[0]) strlcpy(s_tok, cfgc.bambu_token, sizeof(s_tok));
     else                     strlcpy(s_tok, CFG_BAMBU_TOKEN, sizeof(s_tok));
-    if (cfgc.bambu_sn[0])    strlcpy(s_sn, cfgc.bambu_sn, sizeof(s_sn));
-    else                     strlcpy(s_sn, CFG_BAMBU_SERIAL, sizeof(s_sn));
+
+    // 打印机列表:SN/名称按槽位拷贝;NVS 全空则回落 secrets.h 单机。
+    s_mcount = 0;
+    for (int i = 0; i < BAMBU_MACHINE_MAX; i++) {
+        strlcpy(s_sn[i], cfgc.bambu_sn[i], sizeof(s_sn[i]));
+        strlcpy(s_name[i], cfgc.bambu_name[i], sizeof(s_name[i]));
+        if (s_sn[i][0]) s_mcount = i + 1;
+    }
+    if (!s_mcount) {
+        strlcpy(s_sn[0], CFG_BAMBU_SERIAL, sizeof(s_sn[0]));
+        s_mcount = 1;
+    }
+
+    // ===== 多机仿真测试开关(发版前必须置 0)=====
+    // >0 时为单机环境注入假机器:真机数据仍进槽 0,假机器显示"等待数据",
+    // 用于单机环境验证多机概览 UI/按键导航/名称显示。设 1/2/3 看 2/3/4 台布局。
+#ifndef TEST_EXTRA_MACHINES
+#define TEST_EXTRA_MACHINES 0
+#endif
+#if TEST_EXTRA_MACHINES > 0
+    for (int i = 0; i < TEST_EXTRA_MACHINES && s_mcount < BAMBU_MACHINE_MAX; i++) {
+        snprintf(s_sn[s_mcount], sizeof(s_sn[0]), "TESTFAKE%07d", i + 1);
+        snprintf(s_name[s_mcount], sizeof(s_name[0]), "测试%d号机", i + 2);
+        s_mcount++;
+    }
+    ESP_LOGW(TAG, "多机仿真测试:注入 %d 台假机器,共 %d 台(发版前置 0)",
+             TEST_EXTRA_MACHINES, s_mcount);
+#endif
 
     bool configured = s_tok[0] && strncmp(s_tok, "paste", 5) != 0;
     if (!configured) {
@@ -692,7 +741,7 @@ void app_mqtt_start(void)
     esp_mqtt_client_start(s_cli);
 
     if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
-        s_state.cloud = BAMBU_CLOUD_CONNECTING;
+        for (int i = 0; i < s_mcount; i++) s_state[i].cloud = BAMBU_CLOUD_CONNECTING;
         xSemaphoreGive(s_lock);
     }
 
@@ -700,52 +749,62 @@ void app_mqtt_start(void)
     esp_timer_handle_t h;
     esp_timer_create(&t, &h);
     esp_timer_start_periodic(h, PUSH_PERIOD_US);
-    ESP_LOGI(TAG, "MQTT 启动:%s user=%s sn=%s", BROKER_HOST, s_uid, sn());
+    ESP_LOGI(TAG, "MQTT 启动:%s user=%s 机器=%d 台", BROKER_HOST, s_uid, s_mcount);
 }
 
-void app_mqtt_request_now(void)
+int app_mqtt_machine_count(void)
 {
-    push_pushall();
+    return s_mcount;
+}
+
+void app_mqtt_request_now(int idx)
+{
+    push_pushall(idx);
 }
 
 // 发布到 device/<sn>/request。拓竹 OpenBambuAPI 命令格式:
 //   打印控制 {"print":{"sequence_id":"<n>","command":"pause|resume|stop","param":""}}(QoS 1)
 //   腔灯     {"system":{"sequence_id":"<n>","command":"ledctrl","led_node":"chamber_light","led_mode":"on|off"}}
-static void publish_request(const char *payload, int qos)
+static void publish_request(int idx, const char *payload, int qos)
 {
     if (!s_cli) { ESP_LOGW(TAG, "MQTT 未连接,命令丢弃"); return; }
+    if (idx < 0 || idx >= s_mcount) { ESP_LOGW(TAG, "机器下标无效,命令丢弃"); return; }
     char topic[48];
-    snprintf(topic, sizeof(topic), "device/%s/request", sn());
+    snprintf(topic, sizeof(topic), "device/%s/request", sn_at(idx));
     int id = esp_mqtt_client_publish(s_cli, topic, payload, 0, qos, 0);
     ESP_LOGI(TAG, "发布 %s -> %s(%s)", payload, topic, id < 0 ? "失败" : "成功");
 }
 
-void app_mqtt_print_command(const char *cmd)
+void app_mqtt_print_command(int idx, const char *cmd)
 {
     if (!cmd || (strcmp(cmd, "pause") && strcmp(cmd, "resume") && strcmp(cmd, "stop"))) return;
     char payload[160];
     snprintf(payload, sizeof(payload),
              "{\"print\":{\"sequence_id\":\"%u\",\"command\":\"%s\",\"param\":\"\"}}",
              (unsigned)esp_random(), cmd);
-    publish_request(payload, 1);
+    publish_request(idx, payload, 1);
 }
 
-void app_mqtt_set_chamber_light(bool on)
+void app_mqtt_set_chamber_light(int idx, bool on)
 {
     char payload[192];
     snprintf(payload, sizeof(payload),
              "{\"system\":{\"sequence_id\":\"%u\",\"command\":\"ledctrl\","
              "\"led_node\":\"chamber_light\",\"led_mode\":\"%s\"}}",
              (unsigned)esp_random(), on ? "on" : "off");
-    publish_request(payload, 0);
+    publish_request(idx, payload, 0);
 }
 
-void app_mqtt_snapshot(bambu_state_t *out)
+void app_mqtt_snapshot(int idx, bambu_state_t *out)
 {
     if (!out) return;
-    if (!s_lock) { memset(out, 0, sizeof(*out)); out->cloud = BAMBU_CLOUD_OFF; return; }
+    if (!s_lock || idx < 0 || idx >= BAMBU_MACHINE_MAX) {
+        memset(out, 0, sizeof(*out));
+        out->cloud = BAMBU_CLOUD_OFF;
+        return;
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    *out = s_state;
+    *out = s_state[idx];
     xSemaphoreGive(s_lock);
 }
 
@@ -755,7 +814,13 @@ int app_mqtt_uptime_sec(void)
     return (int)((esp_timer_get_time() - s_conn_since) / 1000000LL);
 }
 
-const char *app_mqtt_sn(void)
+const char *app_mqtt_sn(int idx)
 {
-    return sn();
+    return (idx >= 0 && idx < BAMBU_MACHINE_MAX) ? s_sn[idx] : "";
+}
+
+const char *app_mqtt_name(int idx)
+{
+    if (idx < 0 || idx >= BAMBU_MACHINE_MAX) return NULL;
+    return s_name[idx][0] ? s_name[idx] : NULL;
 }

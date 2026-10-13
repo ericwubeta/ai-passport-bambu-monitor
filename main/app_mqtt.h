@@ -1,4 +1,4 @@
-// main/app_mqtt.h —— 拓竹云 MQTT 客户端与打印机状态快照模型。
+// main/app_mqtt.h —— 拓竹云 MQTT 客户端与打印机状态快照模型(多机版)。
 #pragma once
 
 #include <stdbool.h>
@@ -7,6 +7,7 @@
 #define BAMBU_AMS_MAX   4          // 最多同时挂载的 AMS 台数
 #define BAMBU_TRAY_MAX  4          // 每台 AMS 4 个料槽
 #define BAMBU_HMS_MAX   4          // 一次最多记录 4 个 HMS 错误码
+#define BAMBU_MACHINE_MAX 4        // 同账号最多监控 4 台打印机
 
 typedef enum {
     BAMBU_CLOUD_OFF = 0,   // 未启动/未配置
@@ -65,23 +66,27 @@ typedef struct {
     int   hms_count;         // 当前 HMS 错误数(0=无)
 } bambu_state_t;
 
-// 连接拓竹云并开始订阅;之后每 30 秒自动发 pushall 要一次全量状态。
+// 连接拓竹云并开始订阅(每台机器一个 report topic);每 30 秒给各机发 pushall。
 void app_mqtt_start(void);
 
-// 立即再要一次 pushall(OK 键手动刷新时用)。
-void app_mqtt_request_now(void);
+// 配置的机器数(非空 SN 数,1..4)。
+int app_mqtt_machine_count(void);
 
-// 线程安全取一份状态快照。从未收到过数据时 cloud 为 OFF/CONNECTING。
-void app_mqtt_snapshot(bambu_state_t *out);
+// 立即再要一次 pushall(OK 键手动刷新时用)。
+void app_mqtt_request_now(int idx);
+
+// 线程安全取第 idx 台机器的状态快照。从未收到过数据时 cloud 为 OFF/CONNECTING。
+void app_mqtt_snapshot(int idx, bambu_state_t *out);
 
 // 云连接已维持的秒数(设备页显示用)。
 int app_mqtt_uptime_sec(void);
 
-// 当前使用的打印机 SN(NVS 优先,回落 secrets.h),设备页显示用。
-const char *app_mqtt_sn(void);
+// 第 idx 台机器的 SN / 自定义名称(NVS 优先,回落 secrets.h)。名称空则返回 NULL。
+const char *app_mqtt_sn(int idx);
+const char *app_mqtt_name(int idx);
 
-// 打印控制命令:cmd ∈ "pause" / "resume" / "stop"(QoS 1,发布到 request topic)。
-void app_mqtt_print_command(const char *cmd);
+// 打印控制命令:cmd ∈ "pause" / "resume" / "stop"(QoS 1,发布到第 idx 台 request topic)。
+void app_mqtt_print_command(int idx, const char *cmd);
 
 // 腔灯开关命令(on=true 亮)。X2D 支持 chamber_light。
-void app_mqtt_set_chamber_light(bool on);
+void app_mqtt_set_chamber_light(int idx, bool on);

@@ -47,6 +47,19 @@ static lv_obj_t *s_scr;
 static lv_obj_t *s_pages[PAGE_MAX];
 static int s_pages_n;
 static int s_cur;
+static int s_midx;                 // 当前查看的机器下标(0..3)
+
+// ------------------------------------------------------------ 机器概览(多机列表)
+static bool s_ov_mode;      // true = 停留在机器列表(未进入详情)
+static int  s_ov_sel;       // 列表选中项
+static lv_obj_t *s_ov_page;
+static lv_obj_t *s_ov_card[BAMBU_MACHINE_MAX];
+static lv_obj_t *s_ov_dot[BAMBU_MACHINE_MAX];
+static lv_obj_t *s_ov_name[BAMBU_MACHINE_MAX];
+static lv_obj_t *s_ov_pct[BAMBU_MACHINE_MAX];
+static lv_obj_t *s_ov_bar[BAMBU_MACHINE_MAX];
+static lv_obj_t *s_ov_state[BAMBU_MACHINE_MAX];
+static int s_ov_bar_w;
 static int s_slot[PAGE_MAX];   // 导航序号 → 实体页槽位(实体固定:0进度 1温度 2~5AMS 6设备 7控制)
 static lv_timer_t *s_timer;
 static lv_timer_t *s_fast;     // 30ms 快速重绘:承接按键回调里延后的重绘请求
@@ -98,6 +111,10 @@ static bool s_prev_valid;
 static bool s_dirty = true;       // 按键等交互强制重绘
 
 static void refresh_all(void);    // 前向声明(tick_fast 要调,定义在后面)
+static void ov_refresh(void);     // 前向声明(refresh_all 概览模式要调)
+static void detail_build(void);   // 前向声明(概览→详情切换要用)
+static void detail_free(void);    // 前向声明(详情→概览切换要用)
+static void show_page(int idx);   // 前向声明(ov_key 进详情要调)
 static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev);
 
 // 按键回调跑在 button 组件的小栈任务(默认 2~3KB)里,而翻页/重绘很重:
@@ -300,10 +317,19 @@ static void status_bar_build(void)
 
 static void refresh_status_bar(const bambu_state_t *st)
 {
+    // 多机时前缀机器名,单机保持原样
+    const char *cust = app_mqtt_name(s_midx);
+    int machines = app_mqtt_machine_count();
     if (st->hms_count > 0) {
-        char buf[MSG_MAX];
+        static char buf[MSG_MAX];
         const char *txt = hms_lookup(st->hms[0].code, buf, sizeof(buf));
-        lv_label_set_text(s_bar_lbl, txt);
+        if (cust && machines >= 2) {
+            static char t2[MSG_MAX + 24];
+            snprintf(t2, sizeof(t2), "%s · %s", cust, txt);
+            lv_label_set_text(s_bar_lbl, t2);
+        } else {
+            lv_label_set_text(s_bar_lbl, txt);
+        }
         bool paused = st->gcode_state[0] && !strcmp(st->gcode_state, "PAUSE");
         lv_obj_set_style_bg_color(s_bar, lv_color_hex(paused ? C_YELLOW : C_RED), 0);
         lv_obj_set_style_text_color(s_bar_lbl,
@@ -311,9 +337,14 @@ static void refresh_status_bar(const bambu_state_t *st)
     } else {
         const char *cloud = st->cloud == BAMBU_CLOUD_ONLINE    ? "云在线"
                           : st->cloud == BAMBU_CLOUD_CONNECTING ? "云连接中" : "云离线";
-        char t[40];
-        if (st->wifi_signal) snprintf(t, sizeof(t), "%s · 打印机 %d dBm", cloud, st->wifi_signal);
-        else                 snprintf(t, sizeof(t), "%s · 打印机信号 --", cloud);
+        static char t[56];
+        if (cust && machines >= 2) {
+            if (st->wifi_signal) snprintf(t, sizeof(t), "%s · %s · %d dBm", cust, cloud, st->wifi_signal);
+            else                 snprintf(t, sizeof(t), "%s · %s · 信号 --", cust, cloud);
+        } else {
+            if (st->wifi_signal) snprintf(t, sizeof(t), "%s · 打印机 %d dBm", cloud, st->wifi_signal);
+            else                 snprintf(t, sizeof(t), "%s · 打印机信号 --", cloud);
+        }
         lv_label_set_text(s_bar_lbl, t);
         lv_obj_set_style_bg_color(s_bar, lv_color_hex(C_PANEL), 0);
         lv_obj_set_style_text_color(s_bar_lbl, lv_color_hex(C_DIM), 0);
@@ -699,7 +730,7 @@ static void page_device_build(lv_obj_t *p)
 static void refresh_device(const bambu_state_t *st)
 {
     char t[40];
-    lv_label_set_text(s_d_sn, app_mqtt_sn());
+    lv_label_set_text(s_d_sn, app_mqtt_sn(s_midx));
     snprintf(t, sizeof(t), "%d dBm", st->wifi_signal);
     lv_label_set_text(s_d_rssi, t);
 
@@ -899,8 +930,13 @@ static void refresh_header(const bambu_state_t *st)
 
 static void refresh_all(void)
 {
+    // 概览列表模式:只刷列表卡片,不动详情页
+    if (s_ov_mode) {
+        ov_refresh();
+        return;
+    }
     bambu_state_t st;
-    app_mqtt_snapshot(&st);
+    app_mqtt_snapshot(s_midx, &st);
 
     // 脏检查:快照没变、无交互、无倒计时,就只刷头部(时钟/电量/页点),不重排整页
     bool changed = !s_prev_valid || memcmp(&s_prev, &st, sizeof(st)) != 0;
@@ -968,6 +1004,147 @@ static void tick_once(lv_timer_t *t)
     if (s_active) refresh_all();
 }
 
+// ------------------------------------------------------------ 机器概览实现
+// 多机列表页:2台=大卡 / 3台=中卡 / 4台=紧凑卡,关键进度信息常驻。
+// 单机时跳过本页,直接进详情(与旧行为一致)。
+
+static void ov_build(void)
+{
+    s_ov_page = lv_obj_create(s_scr);
+    lv_obj_remove_flag(s_ov_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_ov_page, 0, PAGE_Y);
+    lv_obj_set_size(s_ov_page, 240, PAGE_H);
+    lv_obj_set_style_bg_opa(s_ov_page, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_ov_page, 0, 0);
+    lv_obj_set_style_pad_all(s_ov_page, 0, 0);
+
+    int n = app_mqtt_machine_count();
+    if (n < 1) n = 1;
+    if (n > BAMBU_MACHINE_MAX) n = BAMBU_MACHINE_MAX;
+
+    // 分档布局:卡高/间距按机器数取,整体宽松不挤
+    int card_h, gap, top = 10;
+    if (n <= 2)      { card_h = 110; gap = 12; }
+    else if (n == 3) { card_h = 72;  gap = 10; }
+    else             { card_h = 55;  gap = 7;  }
+    s_ov_bar_w = (n <= 2) ? 196 : (n == 3 ? 190 : 184);
+
+    for (int i = 0; i < n; i++) {
+        int y = top + i * (card_h + gap);
+        s_ov_card[i] = card(s_ov_page, 8, y, 224, card_h, C_PANEL2);
+        // 状态点 + 名称
+        s_ov_dot[i] = rect(s_ov_card[i], 12, 10, 8, 8, C_DIM);
+        lv_obj_set_style_radius(s_ov_dot[i], 4, 0);
+        s_ov_name[i] = label(s_ov_card[i], &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_pos(s_ov_name[i], 26, 3);
+        lv_obj_set_width(s_ov_name[i], 120);
+        lv_label_set_long_mode(s_ov_name[i], LV_LABEL_LONG_DOT);
+        // 进度%(右上)
+        s_ov_pct[i] = label(s_ov_card[i], (n <= 2) ? &font_zh20 : &font_zh14,
+                            C_GREEN, LV_TEXT_ALIGN_RIGHT);
+        lv_obj_set_pos(s_ov_pct[i], 132, 1);
+        lv_obj_set_width(s_ov_pct[i], 80);
+        // 进度条
+        int bar_y = (n <= 2) ? 56 : (n == 3 ? 30 : 26);
+        lv_obj_t *trk = rect(s_ov_card[i], 12, bar_y, s_ov_bar_w, 6, C_LINE);
+        lv_obj_set_style_radius(trk, 3, 0);
+        s_ov_bar[i] = rect(s_ov_card[i], 12, bar_y, 0, 6, C_GREEN);
+        lv_obj_set_style_radius(s_ov_bar[i], 3, 0);
+        // 状态 + 剩余(左下)
+        s_ov_state[i] = label(s_ov_card[i], &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_pos(s_ov_state[i], 12, bar_y + 12);
+        lv_obj_set_width(s_ov_state[i], 200);
+        lv_label_set_long_mode(s_ov_state[i], LV_LABEL_LONG_DOT);
+    }
+    lv_obj_add_flag(s_ov_page, LV_OBJ_FLAG_HIDDEN);
+}
+
+// 状态文字与颜色:RUNNING=打印中/PAUSE=已暂停/FINISH=已完成/FAILED=失败/IDLE=空闲
+static uint32_t ov_state_text(const bambu_state_t *st, char *out, int n)
+{
+    if (st->hms_count > 0) {
+        snprintf(out, n, "HMS 告警");
+        return C_RED;
+    }
+    const char *s = st->gcode_state;
+    if (!strcmp(s, "RUNNING")) {
+        snprintf(out, n, "打印中 · 剩 %d时%d分", st->remain_min / 60, st->remain_min % 60);
+        return C_GREEN;
+    }
+    if (!strcmp(s, "PAUSE"))  { snprintf(out, n, "已暂停"); return C_YELLOW; }
+    if (!strcmp(s, "FINISH")) { snprintf(out, n, "已完成"); return C_CYAN; }
+    if (!strcmp(s, "FAILED")) { snprintf(out, n, "失败");   return C_RED; }
+    snprintf(out, n, "空闲 · 等待任务");
+    return C_DIM;
+}
+
+static void ov_refresh(void)
+{
+    int n = app_mqtt_machine_count();
+    if (n < 1) n = 1;
+    if (n > BAMBU_MACHINE_MAX) n = BAMBU_MACHINE_MAX;
+
+    for (int i = 0; i < n; i++) {
+        bambu_state_t st;
+        app_mqtt_snapshot(i, &st);
+
+        // 名称:自定义名优先,否则"N号机";右侧再带 #尾4 便于区分
+        char nm[40];
+        const char *cust = app_mqtt_name(i);
+        const char *snv = app_mqtt_sn(i);
+        int selen = snv ? (int)strlen(snv) : 0;
+        const char *tail = (selen >= 4) ? snv + selen - 4 : (snv ? snv : "");
+        if (cust && cust[0]) snprintf(nm, sizeof(nm), "%s #%s", cust, tail);
+        else                 snprintf(nm, sizeof(nm), "%d号机 #%s", i + 1, tail);
+        lv_label_set_text(s_ov_name[i], nm);
+
+        // 状态与进度
+        char txt[48];
+        uint32_t col = ov_state_text(&st, txt, sizeof(txt));
+        lv_label_set_text(s_ov_state[i], txt);
+        lv_obj_set_style_text_color(s_ov_state[i], lv_color_hex(col), 0);
+        lv_obj_set_style_bg_color(s_ov_dot[i], lv_color_hex(col), 0);
+        if (st.pct > 0) {
+            lv_label_set_text_fmt(s_ov_pct[i], "%d%%", st.pct);
+            lv_obj_set_width(s_ov_bar[i], s_ov_bar_w * st.pct / 100);
+        } else {
+            lv_label_set_text(s_ov_pct[i], "--");
+            lv_obj_set_width(s_ov_bar[i], 0);
+        }
+
+        // 选中高亮(绿框),HMS 机器红框
+        bool sel = (i == s_ov_sel);
+        uint32_t border = sel ? C_GREEN : (st.hms_count > 0 ? C_RED : C_LINE);
+        lv_obj_set_style_border_width(s_ov_card[i], sel ? 2 : 1, 0);
+        lv_obj_set_style_border_color(s_ov_card[i], lv_color_hex(border), 0);
+    }
+}
+
+// 概览页按键:上下=选择,OK=进详情
+static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
+{
+    int n = app_mqtt_machine_count();
+    if (n < 1) n = 1;
+    if (ev != BSP_BTN_CLICK) return;
+    if (btn == BSP_BTN_UP) {
+        s_ov_sel = (s_ov_sel + n - 1) % n;
+    } else if (btn == BSP_BTN_DOWN) {
+        s_ov_sel = (s_ov_sel + 1) % n;
+    } else if (btn == BSP_BTN_OK) {
+        // 进入选中机器的详情:删概览页释放内存,按需建详情页
+        s_midx = s_ov_sel;
+        s_ov_mode = false;
+        if (s_ov_page) { lv_obj_delete(s_ov_page); s_ov_page = NULL; }
+        detail_build();
+        s_cur = 0;
+        s_show_eta = false;
+        s_prev_valid = false;
+        show_page(0);
+        return;
+    }
+    request_refresh();
+}
+
 // ------------------------------------------------------------ 对外
 
 static void show_page(int idx)
@@ -987,19 +1164,11 @@ static void show_page(int idx)
     request_refresh();      // 延到 LVGL 任务里重绘(不在按键回调里干重活)
 }
 
-void app_printer_enter(void)
+// 详情页(8 个实体页)按需构建/释放:
+// LVGL 内存池在建完详情页后仅剩 ~1.6KB,概览页对象(2~4 张卡)装不下,
+// 两套 UI 绝不能同时存在 —— 概览与详情切换时一建一删。
+static void detail_build(void)
 {
-    if (s_scr) return;
-    app_notify_init();
-
-    s_scr = lv_obj_create(NULL);
-    lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(s_scr, lv_color_hex(C_BG), 0);
-    lv_obj_set_style_border_width(s_scr, 0, 0);
-    lv_obj_set_style_pad_all(s_scr, 0, 0);
-
-    header_build();
-    status_bar_build();
     for (int i = 0; i < PAGE_MAX; i++) {
         s_pages[i] = lv_obj_create(s_scr);
         lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_SCROLLABLE);
@@ -1014,6 +1183,42 @@ void app_printer_enter(void)
     for (int i = 0; i < 4; i++) page_ams_build(s_pages[2 + i], i);
     page_device_build(s_pages[6]);
     page_control_build(s_pages[7]);
+}
+
+static void detail_free(void)
+{
+    for (int i = 0; i < PAGE_MAX; i++) {
+        if (s_pages[i]) { lv_obj_delete(s_pages[i]); s_pages[i] = NULL; }
+    }
+}
+
+void app_printer_enter(void)
+{
+    if (s_scr) return;
+    app_notify_init();
+
+    s_scr = lv_obj_create(NULL);
+    lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(s_scr, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_border_width(s_scr, 0, 0);
+    lv_obj_set_style_pad_all(s_scr, 0, 0);
+
+    header_build();
+    status_bar_build();
+
+    // 多机(≥2 台)先建概览页、详情页按需构建;单机只建详情页(与旧版一致)。
+    s_ov_page = NULL;
+    int mcnt = app_mqtt_machine_count();
+    s_ov_sel = 0;
+    if (mcnt >= 2) {
+        s_ov_mode = true;
+        s_midx = 0;
+        ov_build();
+    } else {
+        s_ov_mode = false;
+        s_midx = 0;
+        detail_build();
+    }
 
     s_cur = 0;
     s_show_eta = false;
@@ -1030,7 +1235,9 @@ void app_printer_enter(void)
     s_pages_n = 4;
     s_need_refresh = false;
     s_pk_valid = false;      // 丢弃进入前残留的按键
-    show_page(0);
+
+    if (s_ov_mode) ov_refresh();
+    else           show_page(0);
 
     lv_screen_load(s_scr);
     // 诊断:LVGL 内置内存池(默认 48KB)使用情况,排查对象创建超池导致卡死
@@ -1053,6 +1260,7 @@ void app_printer_exit(void)
     s_pk_valid = false;
     lv_obj_delete(s_scr);
     s_scr = NULL;
+    s_ov_page = NULL;
     memset(s_pages, 0, sizeof(s_pages));
 }
 
@@ -1060,6 +1268,26 @@ void app_printer_exit(void)
 static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev)
 {
     if (!s_scr) return;
+
+    // 概览列表模式:上下选机器,OK 进详情;长按 OK 返回菜单(由上层 main 处理)
+    if (s_ov_mode) {
+        if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) return;   // 留给上层退出
+        ov_key(btn, ev);
+        return;
+    }
+
+    // 详情模式:长按 OK = 返回机器列表(多机)或返回菜单(单机)
+    if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
+        if (app_mqtt_machine_count() >= 2) {
+            // 详情→概览:删详情页释放内存,重建概览页(两套 UI 不并存)
+            s_ov_mode = true;
+            s_ov_sel = s_midx;
+            detail_free();
+            ov_build();
+            ov_refresh();
+        }
+        return;   // 单机时交给上层返回菜单
+    }
 
     if (ev == BSP_BTN_CLICK) {
         s_dirty = true;      // 交互必重绘(数据可能没变,但选中项/显示模式变了)
@@ -1085,25 +1313,25 @@ static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev)
                 refresh_all();
             } else if (in_ctl) {
                 bambu_state_t st;
-                app_mqtt_snapshot(&st);
+                app_mqtt_snapshot(s_midx, &st);
                 const char *state = st.gcode_state;
                 if (s_ctl_sel == 0) {
-                    if (!strcmp(state, "RUNNING"))      app_mqtt_print_command("pause");
-                    else if (!strcmp(state, "PAUSE"))   app_mqtt_print_command("resume");
+                    if (!strcmp(state, "RUNNING"))      app_mqtt_print_command(s_midx, "pause");
+                    else if (!strcmp(state, "PAUSE"))   app_mqtt_print_command(s_midx, "resume");
                 } else if (s_ctl_sel == 1) {
                     if (!strcmp(state, "RUNNING") || !strcmp(state, "PAUSE")) {
-                        if (s_stop_armed) { s_stop_armed = false; app_mqtt_print_command("stop"); }
+                        if (s_stop_armed) { s_stop_armed = false; app_mqtt_print_command(s_midx, "stop"); }
                         else { s_stop_armed = true; s_stop_armed_at = esp_timer_get_time(); }
                     }
                 } else {
                     s_light_on = !s_light_on;    // 乐观切换,命令后由云端回包纠正
-                    app_mqtt_set_chamber_light(s_light_on);
+                    app_mqtt_set_chamber_light(s_midx, s_light_on);
                 }
-                app_mqtt_request_now();
+                app_mqtt_request_now(s_midx);
                 refresh_all();
                 lv_timer_create(tick_once, 1500, NULL);
             } else {
-                app_mqtt_request_now();
+                app_mqtt_request_now(s_midx);
                 refresh_all();
                 lv_timer_create(tick_once, 1500, NULL);
             }
@@ -1116,4 +1344,9 @@ void app_printer_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 {
     if (!s_scr) return;
     s_pk_btn = btn; s_pk_ev = ev; s_pk_valid = true;
+}
+
+bool app_printer_in_overview(void)
+{
+    return s_scr && s_ov_mode;
 }
