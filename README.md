@@ -59,16 +59,27 @@ avoids stack overflows on the button component's small callback task.
 
 ## First-time setup (no rebuild needed)
 
-1. Flash the firmware and power on the device.
-2. When unprovisioned, the device opens a Wi-Fi hotspot:
+### Step 1: Get Bambu credentials (PC, ~1 minute)
+
+1. Download this repo (or just `tools/get-token.bat` + `tools/get-token.ps1` into the same folder).
+2. **Double-click `tools/get-token.bat`** (Windows, zero install, no Python needed).
+3. Enter your Bambu **phone number** → enter the 6-digit **SMS code** you receive.
+4. The screen prints your **User ID** and **printer serial-number list**; the token is **copied to the clipboard automatically**.
+
+> Linux / macOS users: `python tools/weblogin.py` (needs `pip install requests`). Any other way of obtaining the account accessToken works too.
+
+### Step 2: Write to the device (phone, ~2 minutes)
+
+1. Flash the firmware and power on. When unprovisioned, the device opens a Wi-Fi hotspot:
    - SSID: **Bambu-Setup**　Password: **setup123**
-3. Connect a phone/laptop to it and open <http://192.168.4.1>.
-4. Fill in:
+   (Already provisioned? Long-press OK for the menu and pick "配网/Provision".)
+2. Connect a phone/laptop to it and open <http://192.168.4.1>.
+3. Fill in:
    - Home Wi-Fi SSID / password
-   - Bambu **User ID** (`u_` prefix removed; the numeric part)
-   - **accessToken** from the Bambu cloud session
-   - Printer **serial number** (15 digits, e.g. `00C00AAAA000000`)
-5. Save — the device reboots, joins Wi-Fi and enters the monitor page.
+   - Bambu **User ID** (numeric only, without the `u_` prefix)
+   - Bambu **accessToken** (copied in step 1 — just Ctrl+V)
+   - Printer **serial number** (15 digits, e.g. `00C00AAAA000000`) + optional name; leave printers 2–4 empty for single-printer mode
+4. Save — the device reboots, joins Wi-Fi and enters the monitor page.
 
 Credentials live only in the device's NVS partition. As a legacy fallback,
 `main/secrets.h` (git-ignored; copy from `main/secrets.h.example`) can carry
