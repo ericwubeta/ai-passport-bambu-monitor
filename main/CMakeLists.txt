@@ -3,6 +3,7 @@ idf_component_register(
          "ui_pixel.c"
          "ui_pixel_math.c"
          "app_wifi.c"
+         "app_wifi_menu.c"
          "app_mqtt.c"
          "app_notify.c"
          "app_boot.c"

@@ -15,6 +15,7 @@
 #include "ui_pixel.h"
 #include "app_boot.h"
 #include "app_provision.h"
+#include "app_wifi_menu.h"
 #include "app_printer.h"
 #include "app_wifi.h"
 #include "app_mqtt.h"
@@ -27,6 +28,7 @@ static const char *TAG = "main";
 static const demo_entry_t DEMOS[] = {
     { "打印机", app_printer_enter,   app_printer_exit,   app_printer_key },
     { "配网",   app_provision_enter, app_provision_exit, app_provision_key },
+    { "切网",   app_wifi_menu_enter, app_wifi_menu_exit, app_wifi_menu_key },
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
@@ -140,6 +142,7 @@ void app_main(void) {
 
     s_ok[0] = (bsp_button_init(on_key, NULL) == ESP_OK);   // 页面导航依赖按键
     s_ok[1] = true;                                        // 配网页常驻可用(修:原来进不去)
+    s_ok[2] = true;                                        // 切网页:依赖已保存 WiFi 列表
     bsp_audio_init();                                       // 提示音(完成/失败/HMS)
     bsp_battery_init();                                     // 状态栏电量
 

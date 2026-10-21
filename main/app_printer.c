@@ -92,7 +92,7 @@ static lv_obj_t *s_ams_title[4], *s_ams_sub[4];
 static lv_obj_t *s_ams_swatch[4][4], *s_ams_type[4][4], *s_ams_remain[4][4], *s_ams_mark[4][4];
 static lv_obj_t *s_ams_gauge[4][4];     // 槽位右侧余量竖条
 // 设备页
-static lv_obj_t *s_d_sn, *s_d_rssi, *s_d_ip, *s_d_cloud, *s_d_bat, *s_d_wifi, *s_d_uptime;
+static lv_obj_t *s_d_sn, *s_d_rssi, *s_d_ip, *s_d_cloud, *s_d_wifi_rssi, *s_d_wifi, *s_d_uptime;
 static lv_obj_t *s_d_hms_panel, *s_d_hms_lbl;
 // 控制页
 static lv_obj_t *s_ctl_title, *s_ctl_items[3], *s_ctl_labels[3], *s_ctl_state;
@@ -312,7 +312,7 @@ static void status_bar_build(void)
     rect(s_scr, 0, BAR_Y + BAR_H, 240, 1, C_LINE);
     s_bar_lbl = label(s_bar, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
     lv_label_set_text(s_bar_lbl, "等待数据");
-    lv_label_set_long_mode(s_bar_lbl, LV_LABEL_LONG_CLIP);
+    lv_label_set_long_mode(s_bar_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(s_bar_lbl, 226);
     lv_obj_align(s_bar_lbl, LV_ALIGN_LEFT_MID, 7, 0);
 }
@@ -326,7 +326,7 @@ static void refresh_status_bar(const bambu_state_t *st)
         static char buf[MSG_MAX];
         const char *txt = hms_lookup(st->hms[0].code, buf, sizeof(buf));
         if (cust && machines >= 2) {
-            static char t2[MSG_MAX + 24];
+            static char t2[96];
             snprintf(t2, sizeof(t2), "%s · %s", cust, txt);
             lv_label_set_text(s_bar_lbl, t2);
         } else {
@@ -339,13 +339,16 @@ static void refresh_status_bar(const bambu_state_t *st)
     } else {
         const char *cloud = st->cloud == BAMBU_CLOUD_ONLINE    ? "云在线"
                           : st->cloud == BAMBU_CLOUD_CONNECTING ? "云连接中" : "云离线";
-        static char t[56];
+        // 状态条常驻显示当前连的 WiFi 名,出门自动切网后不用翻页也能确认。
+        // 名字最长 32 字节,缓冲给足;超宽由 label 的 DOT 模式末尾省略。
+        const char *ssid = app_wifi_current_ssid();
+        static char t[96];
         if (cust && machines >= 2) {
-            if (st->wifi_signal) snprintf(t, sizeof(t), "%s · %s · %d dBm", cust, cloud, st->wifi_signal);
-            else                 snprintf(t, sizeof(t), "%s · %s · 信号 --", cust, cloud);
+            if (ssid) snprintf(t, sizeof(t), "%s · %s · %s", cust, cloud, ssid);
+            else      snprintf(t, sizeof(t), "%s · %s", cust, cloud);
         } else {
-            if (st->wifi_signal) snprintf(t, sizeof(t), "%s · 打印机 %d dBm", cloud, st->wifi_signal);
-            else                 snprintf(t, sizeof(t), "%s · 打印机信号 --", cloud);
+            if (ssid) snprintf(t, sizeof(t), "%s · %s", cloud, ssid);
+            else      snprintf(t, sizeof(t), "%s · 未联网", cloud);
         }
         lv_label_set_text(s_bar_lbl, t);
         lv_obj_set_style_bg_color(s_bar, lv_color_hex(C_PANEL), 0);
@@ -709,8 +712,12 @@ static void page_device_build(lv_obj_t *p)
     device_line(p, 54, "打印机IP", &s_d_ip);
     device_line(p, 78, "云连接", &s_d_cloud);
     device_line(p, 102,"在线时长", &s_d_uptime);
+    // WiFi 名单独一行(左侧标签占 70px,值区限宽 136px,超长末尾省略),
+    // 信号强度另起一行:两者挤一行时中文 SSID 会长到压住下一行。
     device_line(p, 126,"通行证WiFi", &s_d_wifi);
-    device_line(p, 150,"通行证电量", &s_d_bat);
+    lv_obj_set_width(s_d_wifi, 136);
+    lv_label_set_long_mode(s_d_wifi, LV_LABEL_LONG_DOT);
+    device_line(p, 150,"信号强度", &s_d_wifi_rssi);
 
     // HMS 告警面板
     s_d_hms_panel = rect(p, 10, 170, 220, 72, 0x1A1418);
@@ -765,15 +772,13 @@ static void refresh_device(const bambu_state_t *st)
     else             snprintf(t, sizeof(t), "%dm%02ds", up / 60, up % 60);
     lv_label_set_text(s_d_uptime, t);
 
-    if (app_wifi_connected()) {
-        snprintf(t, sizeof(t), "%d dBm", app_wifi_rssi());
-    } else {
-        strcpy(t, "未连接");
-    }
-    lv_label_set_text(s_d_wifi, t);
-
-    snprintf(t, sizeof(t), "%d mV", bsp_battery_mv());
-    lv_label_set_text(s_d_bat, t);
+    // 实际关联的 WiFi 名(不是存档里"打算连"的),出门自动切换后可直接确认。
+    // 名字与信号强度分两行显示,避免长 SSID 压到下一行。
+    const char *wifi_ssid = app_wifi_current_ssid();
+    lv_label_set_text(s_d_wifi, wifi_ssid ? wifi_ssid : "未连接");
+    if (wifi_ssid) snprintf(t, sizeof(t), "%d dBm", app_wifi_rssi());
+    else           strcpy(t, "-");
+    lv_label_set_text(s_d_wifi_rssi, t);
 
     // HMS 告警面板
     if (st->hms_count > 0) {

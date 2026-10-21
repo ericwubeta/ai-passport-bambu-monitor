@@ -28,6 +28,7 @@ static char s_pass[CFG_WIFI_MAX][65];
 static int  s_nets;              // 有效组数
 static int  s_cur;               // 当前尝试的组下标
 static int  s_fail;              // 当前组连续失败次数
+static volatile bool s_manual_switch;   // 手动切网中:断开事件不要自动轮换
 
 // ------------------------------------------------------------ 网络选择
 
@@ -100,6 +101,13 @@ static void on_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     xEventGroupClearBits(s_ev, EV_IP);
+    // 手动切网:这次断开是切换动作触发的,直接连新目标,不计失败、不轮换
+    if (s_manual_switch) {
+        s_manual_switch = false;
+        ESP_LOGI(TAG, "手动切换 → %s", s_ssid[s_cur]);
+        connect_current();
+        return;
+    }
     s_fail++;
     // 单组:无限原地重连(与旧行为一致)。
     // 多组:同一组连败 3 次换下一组 —— 走到没去过的地方,自动切换到在场的网络。
@@ -184,6 +192,49 @@ int app_wifi_rssi(void)
     wifi_ap_record_t ap;
     if (!app_wifi_connected() || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return 0;
     return ap.rssi;
+}
+
+const char *app_wifi_current_ssid(void)
+{
+    static char ssid[33];
+    wifi_ap_record_t ap;
+    if (!app_wifi_connected() || esp_wifi_sta_get_ap_info(&ap) != ESP_OK ||
+        !ap.ssid[0])
+        return NULL;
+    strlcpy(ssid, (char *)ap.ssid, sizeof(ssid));
+    return ssid;
+}
+
+// ------------------------------------------------------------ 手动切网(设备端)
+
+int app_wifi_saved_count(void)
+{
+    return s_nets;
+}
+
+const char *app_wifi_saved_ssid(int idx)
+{
+    if (idx < 0 || idx >= s_nets) return NULL;
+    return s_ssid[idx];
+}
+
+bool app_wifi_switch_to(int idx)
+{
+    if (idx < 0 || idx >= s_nets) return false;
+
+    // 已在目标网络上:不做无谓断开(否则会闪断 MQTT)
+    const char *cur = app_wifi_current_ssid();
+    if (cur && strcmp(cur, s_ssid[idx]) == 0) return true;
+
+    s_fail = 0;
+    s_cur = idx;
+    s_manual_switch = true;
+    if (esp_wifi_disconnect() != ESP_OK) {
+        // 当前本来就没连上,不会有断开事件,直接发起新连接
+        s_manual_switch = false;
+        connect_current();
+    }
+    return true;
 }
 
 bool app_wifi_time_ready(void)

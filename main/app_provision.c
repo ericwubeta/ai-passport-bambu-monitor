@@ -7,6 +7,7 @@
 #include "app_provision.h"
 
 #include <stdio.h>
+#include <stdlib.h>      // atoi(delwifi 的槽位下标)
 #include <string.h>
 
 #include "app_config.h"
@@ -100,11 +101,11 @@ static const char *PAGE_HTML =
 "const c=$('#saved');c.innerHTML='';if(!d.wifis.length){"
 "c.innerHTML='<p>还没有保存的 WiFi</p>';return}"
 "const ul=document.createElement('ul');"
-"d.wifis.forEach(w=>{const e=li(w.ssid,'已保存');"
+"d.wifis.forEach(w=>{const e=li(w.ssid);"
 "const b=document.createElement('button');"
 "b.className='mini';b.textContent='删除';"
 "b.onclick=async()=>{await jpost('/delwifi','idx='+w.i);loadSaved();"
-"msg('已删除 '+w.ssid)};"
+"msg('已删除 '+w.ssid+' ,重启后不再连接')};"
 "e.appendChild(b);ul.appendChild(e)});"
 "c.appendChild(ul)}"
 "async function addWifi(){const s=$('#ssid').value.trim();"
@@ -226,6 +227,8 @@ static void schedule_restart(void)
 static esp_err_t root_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
+    // 设备端页面常改,禁止浏览器缓存,避免手机一直拿到旧版表单/脚本
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, PAGE_HTML, strlen(PAGE_HTML));
 }
 
@@ -340,6 +343,10 @@ static esp_err_t delwifi_handler(httpd_req_t *req)
     if (read_body(req, buf, sizeof(buf)) < 0) return ESP_FAIL;
     char idx[8];
     form_field(buf, "idx", idx, sizeof(idx));
+    if (!idx[0]) {              // 缺参数时 atoi("")=0 会误删槽 0,必须挡住
+        send_json(req, "{\"err\":\"缺少 idx\"}");
+        return ESP_OK;
+    }
     int i = atoi(idx);
     if (i < 0 || i >= CFG_WIFI_MAX) {
         send_json(req, "{\"err\":\"下标无效\"}");
