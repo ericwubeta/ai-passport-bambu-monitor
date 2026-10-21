@@ -8,11 +8,12 @@
 
 #define CFG_NVS_NS "aipass"          // NVS 命名空间
 #define CFG_MACHINE_MAX 4            // 同账号最多 4 台打印机
+#define CFG_WIFI_MAX 3               // 最多存 3 组 WiFi(家里 + 手机热点 + 备用)
 
-// 设备配置:WiFi + 拓竹账号 + 打印机列表(1..4 台)。
+// 设备配置:WiFi(多组) + 拓竹账号 + 打印机列表(1..4 台)。
 typedef struct {
-    char wifi_ssid[33];
-    char wifi_pass[65];
+    char wifi_ssid[CFG_WIFI_MAX][33];
+    char wifi_pass[CFG_WIFI_MAX][65];
     char bambu_uid[33];     // u_<USER_ID>
     char bambu_token[257];  // accessToken(较长)
     char bambu_sn[CFG_MACHINE_MAX][33];   // 各打印机序列号(非空 = 有效)
@@ -28,6 +29,9 @@ bool config_save(const device_config_t *cfg);
 
 // 有效机器数(统计非空 SN 槽)。
 int config_machine_count(const device_config_t *cfg);
+
+// 有效 WiFi 组数(统计非空 SSID 槽)。
+int config_wifi_count(const device_config_t *cfg);
 
 // 是否已配网完成(读 configured 标志)。
 bool config_is_provisioned(void);

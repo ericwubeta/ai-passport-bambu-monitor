@@ -36,10 +36,25 @@ bool config_load(device_config_t *cfg) {
 
     // 每个字段用自己的缓冲区大小作 length in/out,否则 nvs_get_str 会误判缓冲区不足。
     size_t n;
-    n = sizeof(cfg->wifi_ssid);   nvs_get_str(s_handle, "wifi_ssid",  cfg->wifi_ssid,  &n);
-    n = sizeof(cfg->wifi_pass);   nvs_get_str(s_handle, "wifi_pass",  cfg->wifi_pass,  &n);
     n = sizeof(cfg->bambu_uid);   nvs_get_str(s_handle, "bambu_uid",  cfg->bambu_uid,  &n);
     n = sizeof(cfg->bambu_token); nvs_get_str(s_handle, "bambu_token", cfg->bambu_token, &n);
+
+    // WiFi 多组:ssid0..2 / pass0..2。兼容旧单组数据:wifi_ssid 单键 → 槽 0。
+    for (int i = 0; i < CFG_WIFI_MAX; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "ssid%d", i);
+        n = sizeof(cfg->wifi_ssid[i]);
+        nvs_get_str(s_handle, key, cfg->wifi_ssid[i], &n);
+        snprintf(key, sizeof(key), "pass%d", i);
+        n = sizeof(cfg->wifi_pass[i]);
+        nvs_get_str(s_handle, key, cfg->wifi_pass[i], &n);
+    }
+    if (!cfg->wifi_ssid[0][0]) {   // 老数据迁移
+        n = sizeof(cfg->wifi_ssid[0]);
+        nvs_get_str(s_handle, "wifi_ssid", cfg->wifi_ssid[0], &n);
+        n = sizeof(cfg->wifi_pass[0]);
+        nvs_get_str(s_handle, "wifi_pass", cfg->wifi_pass[0], &n);
+    }
 
     // 打印机列表:sn0..sn3 / name0..name3。兼容旧单机数据:bambu_sn 单键 → 槽 0。
     for (int i = 0; i < CFG_MACHINE_MAX; i++) {
@@ -61,10 +76,19 @@ bool config_load(device_config_t *cfg) {
 bool config_save(const device_config_t *cfg) {
     if (!cfg || ensure_open() != ESP_OK) return false;
     bool ok = true;
-    ok &= (nvs_set_str(s_handle, "wifi_ssid",  cfg->wifi_ssid)  == ESP_OK);
-    ok &= (nvs_set_str(s_handle, "wifi_pass",  cfg->wifi_pass)  == ESP_OK);
     ok &= (nvs_set_str(s_handle, "bambu_uid",  cfg->bambu_uid)  == ESP_OK);
     ok &= (nvs_set_str(s_handle, "bambu_token", cfg->bambu_token) == ESP_OK);
+    // WiFi 多组:ssid0..2 / pass0..2
+    for (int i = 0; i < CFG_WIFI_MAX; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "ssid%d", i);
+        ok &= (nvs_set_str(s_handle, key, cfg->wifi_ssid[i]) == ESP_OK);
+        snprintf(key, sizeof(key), "pass%d", i);
+        ok &= (nvs_set_str(s_handle, key, cfg->wifi_pass[i]) == ESP_OK);
+    }
+    // 兼容键同步到槽 0,老固件回读不丢
+    ok &= (nvs_set_str(s_handle, "wifi_ssid", cfg->wifi_ssid[0]) == ESP_OK);
+    ok &= (nvs_set_str(s_handle, "wifi_pass", cfg->wifi_pass[0]) == ESP_OK);
     for (int i = 0; i < CFG_MACHINE_MAX; i++) {
         char key[8];
         snprintf(key, sizeof(key), "sn%d", i);
@@ -84,6 +108,14 @@ int config_machine_count(const device_config_t *cfg) {
     int cnt = 0;
     for (int i = 0; i < CFG_MACHINE_MAX; i++)
         if (cfg->bambu_sn[i][0]) cnt++;
+    return cnt;
+}
+
+int config_wifi_count(const device_config_t *cfg) {
+    if (!cfg) return 0;
+    int cnt = 0;
+    for (int i = 0; i < CFG_WIFI_MAX; i++)
+        if (cfg->wifi_ssid[i][0]) cnt++;
     return cnt;
 }
 

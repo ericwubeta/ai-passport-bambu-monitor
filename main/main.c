@@ -93,7 +93,11 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
             DEMOS[s_active].key(btn, ev);
         }
     } else if (ev == BSP_BTN_CLICK) {
-        if (btn == BSP_BTN_OK && s_ok[s_sel]) {
+        if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {     // 菜单里上下选择(修:原来只能选中第一项)
+            int n = (int)DEMO_COUNT;
+            s_sel = (btn == BSP_BTN_UP) ? (s_sel + n - 1) % n : (s_sel + 1) % n;
+            menu_refresh();
+        } else if (btn == BSP_BTN_OK && s_ok[s_sel]) {
             s_active = s_sel;
             ui_pixel_mascot_jump(s_mascot);
             lv_obj_delete(s_menu_scr);
@@ -135,6 +139,7 @@ void app_main(void) {
     bsp_display_backlight(100);
 
     s_ok[0] = (bsp_button_init(on_key, NULL) == ESP_OK);   // 页面导航依赖按键
+    s_ok[1] = true;                                        // 配网页常驻可用(修:原来进不去)
     bsp_audio_init();                                       // 提示音(完成/失败/HMS)
     bsp_battery_init();                                     // 状态栏电量
 
