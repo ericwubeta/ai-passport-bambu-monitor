@@ -14,6 +14,9 @@ It subscribes to the Bambu Cloud MQTT stream and shows live print status, temper
 - **Device page** — printer model, serial, firmware and connection state
 - **Control page** — sends pause/resume/stop and chamber-light commands through the cloud channel (whether the printer executes them depends on the account; third-party tokens are typically read-only)
 - **On-device provisioning** — softAP + web page; Wi-Fi and Bambu credentials are stored in NVS, never compiled in
+- **Scan-and-pick Wi-Fi** — the provisioning page scans nearby 2.4 GHz networks; tap one to fill the SSID, and delete saved networks from the phone
+- **3 saved Wi-Fi networks** — on boot the badge connects to the strongest known network and rotates to the next after repeated failures (home ↔ phone hotspot)
+- **On-device Wi-Fi switcher** — the menu lists saved networks for manual switching; the status bar always shows the current SSID
 - **Multi-printer** — monitor up to 4 printers on the same Bambu account via a card overview with per-printer detail pages (testing status below)
 - **Cyber boot animation** — terminal-style boot log drawn entirely with LVGL primitives
 - ~10 s telemetry refresh, heap-stable for days of continuous monitoring
@@ -75,7 +78,7 @@ avoids stack overflows on the button component's small callback task.
    (Already provisioned? Long-press OK for the menu and pick "配网/Provision".)
 2. Connect a phone/laptop to it and open <http://192.168.4.1>.
 3. Fill in:
-   - Home Wi-Fi SSID / password
+   - Wi-Fi: tap **Scan** and pick a network, or type the SSID / password (up to 3 saved networks; delete unused ones from the list)
    - Bambu **User ID** (numeric only, without the `u_` prefix)
    - Bambu **accessToken** (copied in step 1 — just Ctrl+V)
    - Printer **serial number** (15 digits, e.g. `00C00AAAA000000`) + optional name; leave printers 2–4 empty for single-printer mode
@@ -89,6 +92,23 @@ compile-time defaults.
 > expires periodically. Re-provision when the cloud indicator stays
 > disconnected. Only flash firmware containing your own token to devices you
 > own.
+
+## Wi-Fi management & switching
+
+- **Up to 3 networks** — add / overwrite / delete from the provisioning page; re-adding the same SSID updates its password
+- **Automatic network selection** — on boot the badge scans and connects to the strongest known network; a network that fails 3 times is skipped for the next one
+- **Manual switching on the device** — long-press OK → menu → "Wi-Fi" → choose a network with up/down and press OK; the connected one is marked `当前` (current)
+- **Current SSID visible** — the status bar shows `Cloud online · <SSID>`; the device page shows the SSID and signal strength
+- **2.4 GHz only** (ESP32-C3 hardware limit). Captive-portal Wi-Fi (hotels, airports) cannot be used — use a phone hotspot instead
+
+**Tested on hardware:**
+
+| Scenario | Status |
+| --- | --- |
+| Scan, add and delete networks from the provisioning page | ✅ Verified |
+| Two saved networks, automatic switch-over | ✅ Verified |
+| Manual switching from the device menu | ✅ Verified |
+| Long / CJK SSID names do not overflow | ✅ Verified (status bar and device page) |
 
 ## Multi-printer support & testing status
 
