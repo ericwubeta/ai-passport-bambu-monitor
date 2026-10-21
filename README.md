@@ -56,7 +56,8 @@ ESP32-C3  ── JSON parse ── LVGL pages ── ST7789
    └── credentials from NVS (app_config.c), written by the provisioning page
 ```
 
-Pages are switched with up/down; long-pressing OK returns to the menu. The button
+Pages are switched with up/down; long-pressing OK returns to the menu
+(Printer / Provisioning / Wi-Fi). The button
 callback only records the event — heavy rendering runs from an LVGL timer, which
 avoids stack overflows on the button component's small callback task.
 
