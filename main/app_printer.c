@@ -114,6 +114,8 @@ static void refresh_all(void);    // 前向声明(tick_fast 要调,定义在后�
 static void ov_refresh(void);     // 前向声明(refresh_all 概览模式要调)
 static void detail_build(void);   // 前向声明(概览→详情切换要用)
 static void detail_free(void);    // 前向声明(详情→概览切换要用)
+static void ensure_ams_pages(int n); // 前向声明(refresh_all 随 AMS 数据补建页)
+static void apply_page_vis(int show); // 前向声明(refresh_all 懒建页后收敛可见性)
 static void show_page(int idx);   // 前向声明(ov_key 进详情要调)
 static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev);
 
@@ -946,6 +948,7 @@ static void refresh_all(void)
     int ams_pages = st.ams_count;
     if (ams_pages > 4) ams_pages = 4;
     if (ams_pages == 0 && st.gcode_state[0]) ams_pages = 1;
+    ensure_ams_pages(ams_pages);   // 只建用得到的 AMS 页,省 LVGL 池(新建页默认隐藏)
     // 导航序 → 实体槽位:进度/温度固定,AMS 只取前 ams_pages 个,设备/控制固定 6/7
     {
         int n = 0;
@@ -958,6 +961,7 @@ static void refresh_all(void)
     }
     if (s_cur >= s_pages_n) s_cur = s_pages_n - 1;
     if (s_cur < 0) s_cur = 0;
+    apply_page_vis(s_slot[s_cur]);       // 懒建页后重新收敛可见性(只留当前页)
     int dev_idx = 2 + ams_pages;
     int ctl_idx = dev_idx + 1;
 
@@ -1147,6 +1151,16 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 
 // ------------------------------------------------------------ 对外
 
+// 只显示 show 对应的实体页,其余全部隐藏(NULL = 未建的 AMS 页,跳过)
+static void apply_page_vis(int show)
+{
+    for (int i = 0; i < PAGE_MAX; i++) {
+        if (!s_pages[i]) continue;
+        if (i == show) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void show_page(int idx)
 {
     if (idx >= s_pages_n) idx = s_pages_n - 1;
@@ -1155,32 +1169,50 @@ static void show_page(int idx)
     // 而实际显示哪几页随 AMS 台数变化,必须经 s_slot 映射,否则 AMS 不足 4 台时
     // 会翻到空 AMS 页,设备页/控制页反而永远翻不到。
     int show = (idx >= 0 && idx < s_pages_n && idx < PAGE_MAX) ? s_slot[idx] : 0;
-    for (int i = 0; i < PAGE_MAX; i++) {
-        if (i == show) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-        else           lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-    }
+    apply_page_vis(show);
     s_cur = idx;
     s_stop_armed = false;   // 切页取消停止确认
     request_refresh();      // 延到 LVGL 任务里重绘(不在按键回调里干重活)
 }
 
 // 详情页(8 个实体页)按需构建/释放:
-// LVGL 内存池在建完详情页后仅剩 ~1.6KB,概览页对象(2~4 张卡)装不下,
-// 两套 UI 绝不能同时存在 —— 概览与详情切换时一建一删。
+// LVGL 内存池紧张,概览页与详情页对象绝不能共存 —— 切换时一建一删;
+// AMS 页也按需建(2 台 AMS 不建 4 页,空页白吃池内存曾把池压到 98% 导致渲染崩溃)。
+// 新页一律先隐藏:页面背景透明,可见的新页会直接叠画在当前页上
+// (曾因此把 AMS 页内容混进首页),由 show_page/apply_page_vis 统一控制可见性。
+static lv_obj_t *page_new(void)
+{
+    lv_obj_t *p = lv_obj_create(s_scr);
+    lv_obj_remove_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(p, 0, PAGE_Y);
+    lv_obj_set_size(p, 240, PAGE_H);
+    lv_obj_set_style_bg_opa(p, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(p, 0, 0);
+    lv_obj_set_style_pad_all(p, 0, 0);
+    return p;
+}
+
+// 补建前 n 个 AMS 页(已有则跳过);refresh_all 随数据到达逐页补齐
+static void ensure_ams_pages(int n)
+{
+    if (n > 4) n = 4;
+    for (int i = 0; i < n; i++) {
+        if (s_pages[2 + i]) continue;
+        s_pages[2 + i] = page_new();
+        page_ams_build(s_pages[2 + i], i);
+    }
+}
+
 static void detail_build(void)
 {
-    for (int i = 0; i < PAGE_MAX; i++) {
-        s_pages[i] = lv_obj_create(s_scr);
-        lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(s_pages[i], 0, PAGE_Y);
-        lv_obj_set_size(s_pages[i], 240, PAGE_H);
-        lv_obj_set_style_bg_opa(s_pages[i], LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(s_pages[i], 0, 0);
-        lv_obj_set_style_pad_all(s_pages[i], 0, 0);
-    }
+    s_pages[0] = page_new();
+    s_pages[1] = page_new();
+    for (int i = 2; i <= 5; i++) s_pages[i] = NULL;   // AMS 页延迟到数据到达再建
+    s_pages[6] = page_new();
+    s_pages[7] = page_new();
     page_progress_build(s_pages[0]);
     page_temp_build(s_pages[1]);
-    for (int i = 0; i < 4; i++) page_ams_build(s_pages[2 + i], i);
     page_device_build(s_pages[6]);
     page_control_build(s_pages[7]);
 }

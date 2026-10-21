@@ -20,12 +20,17 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # --- LVGL ---
 CONFIG_LV_COLOR_DEPTH_16=y
+# 关掉 malloc 断言:分配失败时 LVGL 源码自带优雅降级(跳过该字形继续画),
+# 而断言会走 while(1) 死循环把 taskLVGL 锁死(IDLE 饿死 → 看门狗风暴)。
+# 池 98% 满时偶发的字形缓冲分配失败,宁可缺个字不能整机卡死。
+# CONFIG_LV_USE_ASSERT_MALLOC is not set
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
-# LVGL 内置 malloc 池大小(KB)。独立静态区,配太大会挤占系统 RAM 影响 TLS/MQTT。
-# 48KB 时 UI 对象(~43KB)+渲染耗尽导致 SW 渲染卡死;96KB 时 TLS 无内存失败。
-# 精简(LED 环 16 段)后 72KB 平衡两者。
-CONFIG_LV_MEM_SIZE_KILOBYTES=72
+# LVGL 内置 malloc 池大小(字节)。独立静态区,配太大会挤占系统 RAM 影响 TLS/MQTT。
+# 48KB 时 UI 对象(~43KB)+渲染耗尽导致 SW 渲染卡死;72KB 时 TLS 握手堆不足连不上云。
+# 64KB + AMS 页懒构建(见 app_printer.c ensure_ams_pages)后池仅用 46%,两者兼得。
+# 注意:旧键 LV_MEM_SIZE_KILOBYTES 已被 LVGL 9 弃用,必须用 LV_MEM_SIZE(字节)。
+CONFIG_LV_MEM_SIZE=65536
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
