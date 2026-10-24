@@ -14,6 +14,7 @@ It subscribes to the Bambu Cloud MQTT stream and shows live print status, temper
 - **Device page** — printer model, serial, firmware and connection state
 - **Control page** — sends pause/resume/stop and chamber-light commands through the cloud channel (whether the printer executes them depends on the account; third-party tokens are typically read-only)
 - **On-device provisioning** — softAP + web page; Wi-Fi and Bambu credentials are stored in NVS, never compiled in
+- **Phone-only SMS login** — enter the Bambu phone number and SMS code on the provisioning page; the device fetches the User ID, token and printer serials by itself, no PC required
 - **Scan-and-pick Wi-Fi** — the provisioning page scans nearby 2.4 GHz networks; tap one to fill the SSID, and delete saved networks from the phone
 - **3 saved Wi-Fi networks** — on boot the badge connects to the strongest known network and rotates to the next after repeated failures (home ↔ phone hotspot)
 - **On-device Wi-Fi switcher** — the menu lists saved networks for manual switching; the status bar always shows the current SSID
@@ -61,29 +62,21 @@ Pages are switched with up/down; long-pressing OK returns to the menu
 callback only records the event — heavy rendering runs from an LVGL timer, which
 avoids stack overflows on the button component's small callback task.
 
-## First-time setup (no rebuild needed)
-
-### Step 1: Get Bambu credentials (PC, ~1 minute)
-
-1. Download this repo (or just `tools/get-token.bat` + `tools/get-token.ps1` into the same folder).
-2. **Double-click `tools/get-token.bat`** (Windows, zero install, no Python needed).
-3. Enter your Bambu **phone number** → enter the 6-digit **SMS code** you receive.
-4. The screen prints your **User ID** and **printer serial-number list**; the token is **copied to the clipboard automatically**.
-
-> Linux / macOS users: `python tools/weblogin.py` (needs `pip install requests`). Any other way of obtaining the account accessToken works too.
-
-### Step 2: Write to the device (phone, ~2 minutes)
+## First-time setup (phone only, no rebuild needed)
 
 1. Flash the firmware and power on. When unprovisioned, the device opens a Wi-Fi hotspot:
    - SSID: **Bambu-Setup**　Password: **setup123**
    (Already provisioned? Long-press OK for the menu and pick "配网/Provision".)
-2. Connect a phone/laptop to it and open <http://192.168.4.1>.
-3. Fill in:
-   - Wi-Fi: tap **Scan** and pick a network, or type the SSID / password (up to 3 saved networks; delete unused ones from the list)
-   - Bambu **User ID** (numeric only, without the `u_` prefix)
-   - Bambu **accessToken** (copied in step 1 — just Ctrl+V)
-   - Printer **serial number** (15 digits, e.g. `00C00AAAA000000`) + optional name; leave printers 2–4 empty for single-printer mode
-4. Save — the device reboots, joins Wi-Fi and enters the monitor page.
+2. Connect a phone to it and open <http://192.168.4.1>.
+3. **Join Wi-Fi**: tap **Scan**, pick a 2.4 GHz network, enter its password and tap **连接这个 WiFi**.
+   The device stays in APSTA mode, keeping the hotspot up while joining your router. The hotspot may
+   briefly change channel during the join; reconnect the phone if it drops.
+4. **Bambu SMS login**: enter the account phone number → **发送验证码** → enter the 6-digit SMS code →
+   **登录并完成配置**. The device calls the Bambu API directly and fills in the **User ID, accessToken
+   and printer serials** (first 4 printers), saves them to NVS and reboots into the monitor page after 5 s.
+5. No PC or manual token entry is needed. The collapsed **高级：手动填 Token / 序列号** section remains
+   for API changes or per-printer edits; the PC tools `tools/get-token.bat` / `tools/weblogin.py` still
+   work as a fallback.
 
 Credentials live only in the device's NVS partition. As a legacy fallback,
 `main/secrets.h` (git-ignored; copy from `main/secrets.h.example`) can carry

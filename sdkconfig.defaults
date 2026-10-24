@@ -32,5 +32,11 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 # 注意:旧键 LV_MEM_SIZE_KILOBYTES 已被 LVGL 9 弃用,必须用 LV_MEM_SIZE(字节)。
 CONFIG_LV_MEM_SIZE=65536
 
+# --- TLS ---
+# 配网页要在设备端直连 api.bambulab.cn 做短信登录。C3 无 PSRAM,
+# 固定 16KB+4KB 的 TLS 收发缓冲会在握手时把堆吃光(RSA 校验 alloc 失败),
+# 改为按需分配/释放后,配网 HTTPS 与监控 MQTT 大报文都能正常工作。
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000

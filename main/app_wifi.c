@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -29,6 +30,12 @@ static int  s_nets;              // 有效组数
 static int  s_cur;               // 当前尝试的组下标
 static int  s_fail;              // 当前组连续失败次数
 static volatile bool s_manual_switch;   // 手动切网中:断开事件不要自动轮换
+static volatile int64_t s_pause_until_us;   // 配网页切网:在此之前不自动重连
+
+void app_wifi_pause_reconnect(uint32_t ms)
+{
+    s_pause_until_us = esp_timer_get_time() + (int64_t)ms * 1000;
+}
 
 // ------------------------------------------------------------ 网络选择
 
@@ -101,6 +108,11 @@ static void on_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     xEventGroupClearBits(s_ev, EV_IP);
+    // 配网页正在立即切 WiFi:这次断开是页面主动触发的,让页面自己连新网络
+    if (s_pause_until_us && esp_timer_get_time() < s_pause_until_us) {
+        ESP_LOGI(TAG, "配网切网中,跳过自动重连");
+        return;
+    }
     // 手动切网:这次断开是切换动作触发的,直接连新目标,不计失败、不轮换
     if (s_manual_switch) {
         s_manual_switch = false;

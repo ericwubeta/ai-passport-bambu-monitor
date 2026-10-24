@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## v1.4.0 — 2026-10-24
+
+### Added
+
+- **Phone-only first-time setup** — the provisioning page now joins Wi-Fi immediately (APSTA keeps the hotspot alive) and offers Bambu SMS login: phone number → SMS code → the device calls `sendsmscode` / `login` / `user/bind` itself, then fills User ID, accessToken and up to 4 printer serials, saves to NVS and reboots. No PC script or manual token entry is required.
+- **Live network status** — the page polls `/netstatus` and shows the connected SSID and IP before login is allowed.
+- **Advanced fallback section** — manual User ID / token / serial entry stays available in a collapsed section; the PC `get-token.bat` / `weblogin.py` tools remain as a backup.
+
+### Changed
+
+- The device now waits for SNTP time sync before the HTTPS login, because TLS certificate validation fails when the clock is still at epoch 0.
+- Provisioning HTTP task stack raised to 12 KB for the TLS handshake; Wi-Fi auto-reconnect is briefly paused while the page switches networks.
+
 ## v1.3.0 — 2026-10-21
 
 ### Added

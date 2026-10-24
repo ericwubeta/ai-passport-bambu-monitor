@@ -20,3 +20,6 @@ int  app_wifi_saved_count(void);              // 已保存组数(0..CFG_WIFI_MAX
 const char *app_wifi_saved_ssid(int idx);     // 第 idx 组 SSID,越界返回 NULL
 bool app_wifi_switch_to(int idx);             // 切到第 idx 组(异步);参数无效返回 false
 bool  app_wifi_time_ready(void);        // SNTP 已同步(可显示绝对完工时间)
+
+// 配网页立即切网时,短暂关闭自动重连(避免旧网络把新配置顶掉);到期自动恢复。
+void app_wifi_pause_reconnect(uint32_t ms);

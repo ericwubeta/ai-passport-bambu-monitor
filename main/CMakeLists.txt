@@ -15,7 +15,7 @@ idf_component_register(
          "font_zh14.c"
          "font_zh20.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp esp_wifi nvs_flash esp_event esp_netif esp_timer esp_http_server mqtt json mbedtls
+    REQUIRES bsp esp_wifi nvs_flash esp_event esp_netif esp_timer esp_http_server esp_http_client mqtt json mbedtls
 )
 
 # 固件版本宏(取自 CMake project VERSION,供设备页显示)
