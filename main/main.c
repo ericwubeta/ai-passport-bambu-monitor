@@ -22,8 +22,117 @@
 #include "font_zh.h"
 #include "lvgl.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_pm.h"
+#include "driver/usb_serial_jtag.h"
 
 static const char *TAG = "main";
+
+// 空闲熄屏:30s 无按键 → 背光 0 并暂停 LVGL;任意键点亮,并吞掉唤醒它的那一次按键。
+static int64_t s_key_us;
+static bool    s_screen_off;
+static bool    s_swallow_key;
+static esp_timer_handle_t s_scr_timer;
+
+#if CONFIG_PM_ENABLE
+static esp_pm_lock_handle_t s_usb_lock;
+static esp_timer_handle_t   s_usb_timer;
+// 亮屏期间禁止 light sleep:LVGL 每 5ms 醒一次刷 SPI,睡眠/唤醒会打断刷新时序,
+// 画面上表现为明显闪烁。只有熄屏(画面已冻结)之后才放锁,让它真正睡下去。
+static esp_pm_lock_handle_t s_awake_lock;
+
+// USB 守卫:IDF 自带的 USJ 连接监控只要 3ms 收不到 SOF 就放锁,而芯片复位/重枚举
+// 的窗口有几十毫秒,正好够它睡下去;C3 的 USB-Serial-JTAG 在 light sleep 中不工作,
+// 睡下去主机就再也枚举不到,只能断电重来(本版就在这上面栽过一次)。所以自己持一把
+// NO_LIGHT_SLEEP 锁:启动先无条件持 5s 盖住重枚举窗口,之后每 5s 用
+// usb_serial_jtag_is_connected() 复查,连着就继续持,真断了(用电池)才放。
+static void usb_guard_cb(void *arg)
+{
+    (void)arg;
+    if (usb_serial_jtag_is_connected()) return;      // 还连着 USB,继续禁止 light sleep
+    if (s_usb_lock) esp_pm_lock_release(s_usb_lock); // 已断线:放锁,自动 light sleep 生效
+    if (s_usb_timer) esp_timer_stop(s_usb_timer);    // 断线后没必要再复查
+    ESP_LOGI(TAG, "USB 已断开,允许 light sleep");
+}
+
+// 自动 light sleep + DFS(160↔80MHz)。
+static void pm_init(void)
+{
+#if CONFIG_PM_ENABLE
+    const esp_pm_config_t cfg = {
+        .max_freq_mhz       = 160,
+        .min_freq_mhz       = 80,
+        .light_sleep_enable = true,
+    };
+    esp_err_t e = esp_pm_configure(&cfg);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "esp_pm_configure 失败: %s", esp_err_to_name(e));
+        return;
+    }
+    ESP_LOGI(TAG, "PM 就绪: DFS 80~160MHz, 自动 light sleep 开");
+
+    esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usb_guard", &s_usb_lock);
+    if (s_usb_lock) esp_pm_lock_acquire(s_usb_lock);
+    esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "awake", &s_awake_lock);
+    if (s_awake_lock) esp_pm_lock_acquire(s_awake_lock);
+    const esp_timer_create_args_t a = { .name = "usb_guard", .callback = usb_guard_cb };
+    if (esp_timer_create(&a, &s_usb_timer) == ESP_OK)
+        esp_timer_start_periodic(s_usb_timer, 5ULL * 1000 * 1000);
+#endif
+}
+#endif
+
+static void screen_off_tick(void *arg)
+{
+    (void)arg;
+    if (s_screen_off || app_provision_needed()) return;   // 配网页不熄屏
+    if (esp_timer_get_time() - s_key_us < 30LL * 1000 * 1000) return;
+    bsp_display_backlight(0);
+    // 熄屏后停掉 LVGL 的 5ms tick 与全部 lv_timer,CPU 才有连续空闲进入 light sleep。
+    bsp_lvgl_set_suspended(true);
+#if CONFIG_PM_ENABLE
+    if (s_awake_lock) esp_pm_lock_release(s_awake_lock);   // 画面已冻结,允许入睡
+#endif
+    // 已确认熄屏,不再需要每秒检查;下次按键唤醒时重启。
+    if (s_scr_timer) esp_timer_stop(s_scr_timer);
+    s_screen_off = true;
+    ESP_LOGI(TAG, "空闲 30s,熄屏");
+}
+
+static void screen_off_init(void)
+{
+    s_key_us = esp_timer_get_time();
+    const esp_timer_create_args_t a = {
+        .name = "scr_off", .callback = screen_off_tick, .arg = NULL,
+    };
+    if (esp_timer_create(&a, &s_scr_timer) == ESP_OK)
+        esp_timer_start_periodic(s_scr_timer, 1000ULL * 1000);
+}
+
+// true = 这次按键只用于唤醒,不再往下处理。
+static bool screen_off_on_key(bsp_btn_ev_t ev)
+{
+    s_key_us = esp_timer_get_time();
+    if (s_screen_off) {
+        s_screen_off = false;
+#if CONFIG_PM_ENABLE
+        if (s_awake_lock) esp_pm_lock_acquire(s_awake_lock);   // 先禁止入睡,再恢复刷新
+#endif
+        // 先恢复 LVGL(tick + 定时器,并整屏失效),再开背光,避免亮起一帧陈旧画面。
+        bsp_lvgl_set_suspended(false);
+        bsp_display_backlight(100);
+        if (s_scr_timer) esp_timer_start_periodic(s_scr_timer, 1000ULL * 1000);
+        ESP_LOGI(TAG, "按键唤醒,亮屏");
+        if (ev != BSP_BTN_RELEASE) s_swallow_key = true;
+        return true;
+    }
+    if (s_swallow_key) {
+        if (ev == BSP_BTN_RELEASE) s_swallow_key = false;
+        return true;
+    }
+    return false;
+}
 
 static const demo_entry_t DEMOS[] = {
     { "打印机", app_printer_enter,   app_printer_exit,   app_printer_key },
@@ -78,6 +187,7 @@ static void enter_menu(void) {
 // 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)user;
+    if (screen_off_on_key(ev)) return;
     if (!bsp_lvgl_lock(500)) return;
 
     if (s_active >= 0) {
@@ -138,7 +248,9 @@ void app_main(void) {
                  BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
         return;
     }
+    pm_init();
     bsp_display_backlight(100);
+    screen_off_init();
 
     s_ok[0] = (bsp_button_init(on_key, NULL) == ESP_OK);   // 页面导航依赖按键
     s_ok[1] = true;                                        // 配网页常驻可用(修:原来进不去)

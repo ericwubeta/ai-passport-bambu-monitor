@@ -172,8 +172,9 @@ void app_wifi_start(void)
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_disconnect, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_ip, NULL);
 
-    // 关闭省电模式,避免某些路由器关联超时
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    // modem sleep:射频在 DTIM 间隔休眠,待机电流显著低于 PS_NONE。
+    // 若某些路由器出现关联超时/掉线,可回退为 WIFI_PS_NONE。
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 

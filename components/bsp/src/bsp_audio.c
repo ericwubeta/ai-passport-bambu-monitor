@@ -8,8 +8,17 @@
 #include "es8311_codec.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 
 static const char *TAG = "bsp_audio";
+
+#if CONFIG_PM_ENABLE
+// 播放期间禁止自动 light sleep:I2S 的 DMA 依赖 APB 时钟,CPU 睡下去会让
+// 缓冲供给中断,提示音出现卡顿/爆音。只在 codec 打开到关闭之间持锁。
+static esp_pm_lock_handle_t s_pm_lock;
+#endif
 
 static esp_codec_dev_handle_t s_dev;
 static i2s_chan_handle_t      s_tx, s_rx;
@@ -63,11 +72,8 @@ static esp_err_t i2s_full_duplex_init(void) {
     if ((e = i2s_channel_init_std_mode(s_rx, &std)) != ESP_OK) {
         ESP_LOGE(TAG, "i2s rx 初始化失败: %s", esp_err_to_name(e)); return e;
     }
-    // esp_codec_dev_open 内部重配前会先 i2s_channel_disable,而 disable 要求通道处于
-    // RUNNING;刚 init 的通道是 READY,会打一条 "channel has not been enabled yet" 错误日志。
-    // 这里先 enable 一次让那次 disable 合法(此时 codec 未配,不出声)。
-    i2s_channel_enable(s_tx);
-    i2s_channel_enable(s_rx);
+    // 注意:这里【不】enable 通道。MCLK/BCLK 一旦 enable 就会持续输出,是空闲功耗来源。
+    // 需要合法 disable 的时机由 bsp_audio_set_format() 在 open 前补 enable。
     return ESP_OK;
 }
 
@@ -118,6 +124,12 @@ esp_err_t bsp_audio_init(void) {
     });
     if (!s_dev) { ESP_LOGE(TAG, "esp_codec_dev_new 失败"); return ESP_FAIL; }
 
+#if CONFIG_PM_ENABLE
+    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "bsp_audio", &s_pm_lock) != ESP_OK) {
+        ESP_LOGW(TAG, "音频 PM 锁创建失败,播放可能与 light sleep 冲突");
+    }
+#endif
+
     ESP_LOGI(TAG, "ES8311 就绪");
     return ESP_OK;
 }
@@ -129,11 +141,13 @@ esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch) {
     if (s_opened) {
         esp_codec_dev_close(s_dev);
         s_opened = false;
-        // close 把 I2S 通道退回 READY,而接下来的 open 内部又会 disable 一次 →
-        // 会打 "channel has not been enabled yet"。补一次 enable 让它合法。
-        if (s_tx) i2s_channel_enable(s_tx);
-        if (s_rx) i2s_channel_enable(s_rx);
     }
+
+    // open 内部重配前会先 i2s_channel_disable,而 disable 要求通道处于 RUNNING;
+    // 空闲关闭后通道是 READY,不补 enable 会打 "channel has not been enabled yet"
+    // 错误日志(不影响功能)。这里补一次,代价只是播放瞬间的时钟启动。
+    if (s_tx) i2s_channel_enable(s_tx);
+    if (s_rx) i2s_channel_enable(s_rx);
 
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = bits,
@@ -151,7 +165,24 @@ esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch) {
     esp_codec_dev_set_in_gain(s_dev, 30.0f);
 
     s_opened = true; s_hz = hz; s_bits = bits; s_ch = ch;
+#if CONFIG_PM_ENABLE
+    if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
+#endif
     ESP_LOGI(TAG, "codec 打开 %luHz/%ubit/%uch", (unsigned long)hz, bits, ch);
+    return ESP_OK;
+}
+
+esp_err_t bsp_audio_close(void) {
+    if (!s_dev || !s_opened) return ESP_OK;
+    // esp_codec_dev_close 内部会先关 codec(ES8311 静音并掉电),再 disable I2S 通道,
+    // disable 会等 DMA 里剩余的音频送完,所以不会截断尾音。
+    esp_codec_dev_close(s_dev);
+#if CONFIG_PM_ENABLE
+    if (s_pm_lock) esp_pm_lock_release(s_pm_lock);
+#endif
+    s_opened = false;
+    s_hz = 0; s_bits = 0; s_ch = 0;
+    ESP_LOGI(TAG, "codec 关闭,进入空闲省电");
     return ESP_OK;
 }
 

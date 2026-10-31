@@ -133,3 +133,20 @@ bool bsp_lvgl_lock(int timeout_ms) {
 void bsp_lvgl_unlock(void) {
     if (s_disp) lvgl_port_unlock();
 }
+
+void bsp_lvgl_set_suspended(bool suspend) {
+    if (!s_disp) return;
+    // lv_timer_enable 与 tick 定时器都要和 LVGL 任务串行,故先拿 port 锁。
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(TAG, "暂停/恢复 LVGL 时拿锁超时");
+        return;
+    }
+    if (suspend) {
+        lvgl_port_stop();      // lv_timer_enable(false) + 停 5ms tick
+    } else {
+        lvgl_port_resume();    // 重启 5ms tick + 重新启用 lv_timer
+        lv_obj_t *scr = lv_screen_active();
+        if (scr) lv_obj_invalidate(scr);
+    }
+    lvgl_port_unlock();
+}

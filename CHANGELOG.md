@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## v1.5.0 — 2026-10-31
+
+### Added
+
+- **Idle screen-off** — after 30 s without a key press the backlight turns off and LVGL stops its 5 ms tick, so the badge is dark instead of glowing all day. Any key wakes it and lights the screen again.
+- **Power management** — Wi-Fi modem sleep, audio that opens the codec only while a prompt tone is playing, and automatic light sleep with 80/160 MHz frequency scaling once the screen is off. Measured on a 500 mAh pack: average current dropped from about 79 mA to about 30 mA (idle runtime roughly 6 h → 15 h).
+- **USB guard** — automatic light sleep is held off whenever the USB-serial console is attached, because the native USB port is unavailable in light sleep on this chip; this also keeps flashing and serial logs working.
+
+### Fixed
+
+- **Stuck on "Connecting" after the screen woke up** — the Bambu cloud answers the first state request with a single ~11.7 kB encrypted record, which needs one contiguous 11.7 kB block. With the previous memory layout that allocation failed, the TLS read aborted and the client looped in reconnect without ever showing printer data. Memory is now laid out so the record fits: LVGL pool 64 → 56 KB (48 KB makes LVGL write out of bounds), Wi-Fi dynamic buffers 32 → 16 and static RX 10 → 8, and TLS certificate copies are released after the handshake.
+
 ## v1.4.0 — 2026-10-24
 
 ### Added

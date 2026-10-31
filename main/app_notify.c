@@ -84,20 +84,22 @@ static void play_notes(const note_t *seq)
 static void notify_task(void *arg)
 {
     (void)arg;
-    bsp_audio_set_format(SAMPLE_RATE, 16, 1);
-    bsp_audio_set_volume(80);
     for (;;) {
-        if (s_req >= 0) {
-            int k = s_req;
-            s_req = -1;
-            switch (k) {
-            case NOTIFY_FINISH: play_notes(S_FINISH); break;
-            case NOTIFY_FAIL:   play_notes(S_FAIL);   break;
-            case NOTIFY_PAUSE:  play_notes(S_PAUSE);  break;
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(40));
+        // 没请求时彻底阻塞,既不轮询也不占 CPU;也不用抱着 codec 常开。
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        int k = s_req;
+        s_req = -1;
+        if (k < NOTIFY_FINISH || k > NOTIFY_PAUSE) continue;
+        if (bsp_audio_set_format(SAMPLE_RATE, 16, 1) != ESP_OK) continue;
+        bsp_audio_set_volume(80);
+        switch (k) {
+        case NOTIFY_FINISH: play_notes(S_FINISH); break;
+        case NOTIFY_FAIL:   play_notes(S_FAIL);   break;
+        case NOTIFY_PAUSE:  play_notes(S_PAUSE);  break;
         }
+        vTaskDelay(pdMS_TO_TICKS(30));   // 等最后一段 DMA 送完,避免切断/爆音
+        bsp_audio_close();              // 播完立即关 codec 与 I2S 时钟
     }
 }
 
@@ -113,5 +115,8 @@ void app_notify_init(void)
 void app_notify_trigger(notify_kind_t kind)
 {
     app_notify_init();
-    if (kind >= NOTIFY_FINISH && kind <= NOTIFY_PAUSE) s_req = (int)kind;
+    if (kind >= NOTIFY_FINISH && kind <= NOTIFY_PAUSE) {
+        s_req = (int)kind;
+        xTaskNotifyGive(s_task);
+    }
 }

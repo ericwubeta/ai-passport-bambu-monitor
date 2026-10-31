@@ -28,15 +28,41 @@ CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 # LVGL 内置 malloc 池大小(字节)。独立静态区,配太大会挤占系统 RAM 影响 TLS/MQTT。
 # 48KB 时 UI 对象(~43KB)+渲染耗尽导致 SW 渲染卡死;72KB 时 TLS 握手堆不足连不上云。
-# 64KB + AMS 页懒构建(见 app_printer.c ensure_ams_pages)后池仅用 46%,两者兼得。
+# 拓竹云端 pushall 回报单条 TLS record 约 11.7KB,需要一次性连续 11.7KB:
+# 64KB 池时最大空闲块不足 → 连接后读不到报文,表现为一直"连接中";
+# 48KB 池会触发 LVGL 写越界崩溃(Store access fault)。56KB 是实测可用的折中。
 # 注意:旧键 LV_MEM_SIZE_KILOBYTES 已被 LVGL 9 弃用,必须用 LV_MEM_SIZE(字节)。
-CONFIG_LV_MEM_SIZE=65536
+CONFIG_LV_MEM_SIZE=57344
 
 # --- TLS ---
 # 配网页要在设备端直连 api.bambulab.cn 做短信登录。C3 无 PSRAM,
 # 固定 16KB+4KB 的 TLS 收发缓冲会在握手时把堆吃光(RSA 校验 alloc 失败),
 # 改为按需分配/释放后,配网 HTTPS 与监控 MQTT 大报文都能正常工作。
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# 握手结束后释放配置里的证书/CA 副本,给数据阶段的 11.7KB TLS record 让出连续内存。
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+
+# C3 无 PSRAM:无线驱动默认 32 个动态收/发缓冲会长期占满内部 RAM,
+# 导致 11.7KB 的 TLS record 找不到连续空间。降到 16 仍够 2.4GHz 单连接监控使用。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+# --- 功耗管理 ---
+# 自动 light sleep:空闲时把 CPU 停掉,PM 在下一个定时器触发前唤醒。
+# 真正能否睡下去还取决于是否有 4 个 tick(4ms)的连续空闲,所以 LVGL 的 5ms tick
+# 与按键 5ms 扫描必须在熄屏时让路(见 bsp_lvgl_set_suspended / BUTTON_PERIOD_TIME_MS)。
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=4
+CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
+# USB 连着时禁止自动 light sleep,否则 USB-Serial-JTAG 控制台会在休眠中断流。
+# 拔线用电池时自动释放该锁,light sleep 正常生效。
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
+# 按键扫描 5ms → 20ms:5ms 的 esp_timer 周期性唤醒会完全堵死 light sleep。
+# 去抖 2 tick = 40ms,短按 180ms / 长按 500ms 的判定精度仍然足够。
+CONFIG_BUTTON_PERIOD_TIME_MS=20
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000

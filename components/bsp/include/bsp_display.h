@@ -46,3 +46,8 @@ struct _lv_display_t *bsp_lvgl_init(void);
 // LVGL 尚未就绪或超时时 lock 返回 false；只有 lock 成功后才调用 unlock。
 bool bsp_lvgl_lock(int timeout_ms);
 void bsp_lvgl_unlock(void);
+
+// 屏幕熄灭期间暂停 LVGL:停掉 5ms tick 并禁用所有 lv_timer,使渲染任务进入
+// 长睡眠(不会每 1ms 醒一次),CPU 才有连续空闲进入 light sleep。
+// 恢复时会重新启动 tick 并整屏失效重绘。像素内容保持在上次熄灭时的一帧。
+void bsp_lvgl_set_suspended(bool suspend);
