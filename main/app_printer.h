@@ -1,4 +1,5 @@
-// main/app_printer.h —— 打印机状态主界面:多机概览 + 5 个详情页,上下键切换,30 秒自动刷新。
+// Printer overview and detail pages: progress, camera, temperature, AMS, device,
+// controls. Camera is always the second detail page; up/down navigate.
 #pragma once
 
 #include <stdbool.h>

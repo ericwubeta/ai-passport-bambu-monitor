@@ -2,10 +2,15 @@
 #pragma once
 
 typedef enum {
+    NOTIFY_NONE = -1,
     NOTIFY_FINISH = 0,   // 打印完成:上行音阶
     NOTIFY_FAIL,         // 打印失败:下行音阶
     NOTIFY_PAUSE,        // 暂停:两声短促
 } notify_kind_t;
+
+// First snapshots and repeated/idle terminal states are silent. This operates
+// on real per-printer reports, independently of the currently displayed page.
+notify_kind_t app_notify_transition(const char *previous, const char *current);
 
 // 初始化(懒创建音频任务,幂等)。由 app_printer_enter 调用。
 void app_notify_init(void);

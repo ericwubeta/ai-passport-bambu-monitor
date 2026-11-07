@@ -19,6 +19,7 @@
 #include "app_printer.h"
 #include "app_wifi.h"
 #include "app_mqtt.h"
+#include "app_camera.h"
 #include "font_zh.h"
 #include "lvgl.h"
 #include "esp_log.h"
@@ -83,10 +84,34 @@ static void pm_init(void)
 }
 #endif
 
+static void screen_wake(void)
+{
+    if (!s_screen_off) return;
+    s_screen_off = false;
+#if CONFIG_PM_ENABLE
+    if (s_awake_lock) esp_pm_lock_acquire(s_awake_lock);
+#endif
+    // Resume rendering before lighting the panel, as with a key wake.
+    bsp_lvgl_set_suspended(false);
+    bsp_display_backlight(100);
+}
+
 static void screen_off_tick(void *arg)
 {
     (void)arg;
-    if (s_screen_off || app_provision_needed()) return;   // 配网页不熄屏
+    static bool usb_was_connected;
+    bool usb_connected = bsp_battery_usb_connected();
+    if (usb_connected != usb_was_connected) {
+        usb_was_connected = usb_connected;
+        ESP_LOGI(TAG, "USB host power=%d, screen_off=%d", usb_connected, s_screen_off);
+    }
+    if (usb_connected) {
+        // Refresh the idle deadline so unplugging starts a new 30-second wait.
+        s_key_us = esp_timer_get_time();
+        screen_wake();
+        return;
+    }
+    if (s_screen_off || app_provision_needed() || app_camera_active()) return;
     if (esp_timer_get_time() - s_key_us < 30LL * 1000 * 1000) return;
     bsp_display_backlight(0);
     // 熄屏后停掉 LVGL 的 5ms tick 与全部 lv_timer,CPU 才有连续空闲进入 light sleep。
@@ -94,8 +119,7 @@ static void screen_off_tick(void *arg)
 #if CONFIG_PM_ENABLE
     if (s_awake_lock) esp_pm_lock_release(s_awake_lock);   // 画面已冻结,允许入睡
 #endif
-    // 已确认熄屏,不再需要每秒检查;下次按键唤醒时重启。
-    if (s_scr_timer) esp_timer_stop(s_scr_timer);
+    // Keep the one-second power check alive while dark to handle USB attach.
     s_screen_off = true;
     ESP_LOGI(TAG, "空闲 30s,熄屏");
 }
@@ -115,14 +139,7 @@ static bool screen_off_on_key(bsp_btn_ev_t ev)
 {
     s_key_us = esp_timer_get_time();
     if (s_screen_off) {
-        s_screen_off = false;
-#if CONFIG_PM_ENABLE
-        if (s_awake_lock) esp_pm_lock_acquire(s_awake_lock);   // 先禁止入睡,再恢复刷新
-#endif
-        // 先恢复 LVGL(tick + 定时器,并整屏失效),再开背光,避免亮起一帧陈旧画面。
-        bsp_lvgl_set_suspended(false);
-        bsp_display_backlight(100);
-        if (s_scr_timer) esp_timer_start_periodic(s_scr_timer, 1000ULL * 1000);
+        screen_wake();
         ESP_LOGI(TAG, "按键唤醒,亮屏");
         if (ev != BSP_BTN_RELEASE) s_swallow_key = true;
         return true;
@@ -234,9 +251,20 @@ static void boot_done(void) {
     app_mqtt_start();
     s_active = 0;
     DEMOS[0].enter();
+#if CONFIG_CAMERA_START_ON_SECOND_PAGE || defined(CAMERA_DIAGNOSTIC_START)
+    if (app_mqtt_machine_count() == 1) app_printer_key(BSP_BTN_DOWN, BSP_BTN_CLICK);
+#endif
 }
 
 void app_main(void) {
+#ifdef NOTIFY_TRANSITION_SELFTEST
+    extern void notify_transition_selftest(void);
+    notify_transition_selftest();
+#endif
+#if CONFIG_CAMERA_GEOMETRY_SELFTEST
+    extern void camera_geometry_selftest(void);
+    camera_geometry_selftest();
+#endif
     ESP_LOGI(TAG, "AI Passport 打印机固件启动");
 
     bsp_i2c_init();

@@ -5,15 +5,82 @@
 #include "bsp_pins.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
+#include "esp_lcd_panel_ops.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "bsp_lvgl";
 
-#define BSP_LVGL_DRAW_BUFFER_LINES 40
+#define BSP_LVGL_DRAW_BUFFER_LINES 20
 
 static lv_display_t *s_disp;
 static bool s_port_initialized;
 static bool s_port_init_failed;
+static SemaphoreHandle_t s_transfer_done;
+static bool s_stream_active;
+static int s_stream_y, s_stream_h;
+static uint32_t s_stream_token;
+
+static bool spi_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *event, void *context) {
+    BaseType_t wake = pdFALSE;
+    xSemaphoreGiveFromISR(s_transfer_done, &wake);
+    return wake == pdTRUE;
+}
+
+static bool draw_sync(int x, int y, int width, int height, const void *data) {
+    if (width <= 0 || height <= 0) return true;
+    // Completion ownership is shared by the LVGL flush and streaming paths; both
+    // are serialized by the recursive port lock. Buffers remain live until done.
+    xSemaphoreTake(s_transfer_done, 0);
+    if (esp_lcd_panel_draw_bitmap(bsp_display_panel(), x, y, x + width, y + height, data) != ESP_OK) return false;
+    xSemaphoreTake(s_transfer_done, portMAX_DELAY);
+    return true;
+}
+
+static void stream_aware_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *pixels) {
+    int width = lv_area_get_width(area);
+    int height = lv_area_get_height(area);
+    lv_draw_sw_rgb565_swap(pixels, width * height);
+    int top_end = area->y2 + 1;
+    if (s_stream_active && top_end > s_stream_y && area->y1 < s_stream_y + s_stream_h) {
+        top_end = s_stream_y < area->y1 ? area->y1 : s_stream_y;
+        draw_sync(area->x1, area->y1, width, top_end - area->y1, pixels);
+        int bottom = s_stream_y + s_stream_h;
+        if (bottom < area->y1) bottom = area->y1;
+        if (bottom <= area->y2)
+            draw_sync(area->x1, bottom, width, area->y2 + 1 - bottom,
+                      pixels + (bottom - area->y1) * width * 2);
+    } else {
+        draw_sync(area->x1, area->y1, width, height, pixels);
+    }
+    lv_display_flush_ready(disp);
+}
+
+bool bsp_lvgl_stream_set(int y, int height, uint32_t token) {
+    if (!s_disp || !token || y < BSP_LVGL_SCREEN_RADIUS || height <= 0 ||
+        y + height > BSP_LCD_H - BSP_LVGL_SCREEN_RADIUS) return false;
+    s_stream_y = y; s_stream_h = height; s_stream_token = token; s_stream_active = true;
+    return true;
+}
+
+void bsp_lvgl_stream_end(uint32_t token) {
+    if (s_stream_active && (!token || s_stream_token == token)) {
+        s_stream_active = false;
+        // Clear unverified pixels after an interrupted partial frame as well
+        // as its text, before displaying a reconnect hint or a different page.
+        lv_obj_invalidate(lv_screen_active());
+    }
+}
+
+bool bsp_lvgl_stream_draw(uint32_t token, int x, int y, int width, int height, const uint16_t *pixels) {
+    if (!pixels || width <= 0 || height <= 0 || x < 0 || x + width > BSP_LCD_W) return false;
+    if (!lvgl_port_lock(150)) return false;
+    bool ok = s_stream_active && token == s_stream_token && y >= s_stream_y &&
+              y + height <= s_stream_y + s_stream_h;
+    if (ok) ok = draw_sync(x, y, width, height, pixels);
+    lvgl_port_unlock();
+    return ok;
+}
 
 static void rounded_flush_event(lv_event_t *event)
 {
@@ -82,8 +149,8 @@ lv_display_t *bsp_lvgl_init(void) {
     const lvgl_port_display_cfg_t dc = {
         .panel_handle = bsp_display_panel(),
         .io_handle    = bsp_display_io(),
-        // ⚠ C3 无 PSRAM,DMA 只能用内部 RAM。40 行单缓冲约 19.2KB，
-        // 可减少窗口命令和队列提交次数；仍保留单缓冲，避免双缓冲挤压音频/Wi-Fi。
+        // 20-line single buffer saves 9.6KB for camera TLS beside MQTT. Keep
+        // the existing LVGL pool unchanged; verify SPI/rendering on hardware.
         .buffer_size   = (uint32_t)BSP_LCD_W * BSP_LVGL_DRAW_BUFFER_LINES,
         .double_buffer = false,
         .hres = BSP_LCD_W, .vres = BSP_LCD_H,
@@ -115,6 +182,20 @@ lv_display_t *bsp_lvgl_init(void) {
         // race the next init (or even run before the task sets running=true).
         return NULL;
     }
+    s_transfer_done = xSemaphoreCreateBinary();
+    if (!s_transfer_done) {
+        lvgl_port_remove_disp(disp);
+        lvgl_port_unlock();
+        return NULL;
+    }
+    esp_lcd_panel_io_callbacks_t callbacks = {.on_color_trans_done = spi_done};
+    if (esp_lcd_panel_io_register_event_callbacks(bsp_display_io(), &callbacks, NULL) != ESP_OK) {
+        vSemaphoreDelete(s_transfer_done); s_transfer_done = NULL;
+        lvgl_port_remove_disp(disp);
+        lvgl_port_unlock();
+        return NULL;
+    }
+    lv_display_set_flush_cb(disp, stream_aware_flush);
 
     // Mask the final RGB565 flush instead of using root-screen clip_corner.
     // Full-screen rounded clipping creates an ARGB layer that does not fit the

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include "app_config.h"
+#include "app_notify.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -18,10 +19,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "mqtt_client.h"
+#include "mbedtls/ssl.h"
 
-#include "secrets.h"
+#include "app_secrets.h"
 
 static const char *TAG = "app_mqtt";
+
+static esp_err_t mqtt_tls_attach(void *config) {
+    esp_err_t err = esp_crt_bundle_attach(config);
+    if (err != ESP_OK) return err;
+    // Negotiate smaller TLS records without changing MQTT's complete-message
+    // buffer or parsing. This leaves contiguous RAM for camera TLS alongside it.
+    return mbedtls_ssl_conf_max_frag_len(config, MBEDTLS_SSL_MAX_FRAG_LEN_4096) == 0 ? ESP_OK : ESP_FAIL;
+}
 
 #define BROKER_HOST "cn.mqtt.bambulab.com"
 #define PUSH_PERIOD_US (30ULL * 1000000ULL)
@@ -333,6 +343,7 @@ static bool jstr(const char *v, const char *ve, char *out, int n)
 static void parse_report(int idx, const char *data, int len)
 {
     bambu_state_t *const st = &s_state[idx];
+    notify_kind_t notification = NOTIFY_NONE;
     // X2D 全量快照(含 AMS/2D 信息)可达 10~15KB,buffer 已配 20KB。
     // 轻量扫描不建树,内存 O(1),不受堆限制。
     if (len > 18 * 1024) return;
@@ -348,7 +359,8 @@ static void parse_report(int idx, const char *data, int len)
         v = jpath(pr, plen, "gcode_state", &ve);
         if (v) {
             char gs[10];
-            if (jstr(v, ve, gs, sizeof(gs))) {
+            if (jstr(v, ve, gs, sizeof(gs)) && gs[0]) {
+                notification = app_notify_transition(st->gcode_state, gs);
                 bool changed = strcmp(st->gcode_state, gs) != 0;
                 strlcpy(st->gcode_state, gs, sizeof(st->gcode_state));
                 // 状态切换到 IDLE / FINISH / FAILED 且不再是打印中:
@@ -580,6 +592,13 @@ static void parse_report(int idx, const char *data, int len)
         xSemaphoreGive(s_lock);
     }
 
+    // Only an observed transition in this printer's real report may notify.
+    // The first historical FINISH snapshot after boot is merely a baseline.
+    if (notification != NOTIFY_NONE) {
+        ESP_LOGI(TAG, "printer=%d notification=%d", idx, notification);
+        app_notify_trigger(notification);
+    }
+
     // 节流打印提取摘要,便于确认解析与内存状态(INFO 级)
     {
         static int64_t s_last_summary;
@@ -728,7 +747,7 @@ void app_mqtt_start(void)
     cfg.broker.address.hostname = BROKER_HOST;
     cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
     cfg.broker.address.port = 8883;
-    cfg.broker.verification.crt_bundle_attach = &esp_crt_bundle_attach;
+    cfg.broker.verification.crt_bundle_attach = mqtt_tls_attach;
     cfg.credentials.username = s_uid;
     cfg.credentials.authentication.password = s_tok;
     cfg.credentials.client_id = cid;   // IDF 5.5: client_id 在 credentials 下

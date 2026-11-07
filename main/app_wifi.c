@@ -15,7 +15,7 @@
 #include "lwip/ip4_addr.h"
 #include "nvs_flash.h"
 
-#include "secrets.h"
+#include "app_secrets.h"
 
 static const char *TAG = "app_wifi";
 

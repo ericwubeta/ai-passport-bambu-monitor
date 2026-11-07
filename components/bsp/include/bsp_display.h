@@ -51,3 +51,11 @@ void bsp_lvgl_unlock(void);
 // 长睡眠(不会每 1ms 醒一次),CPU 才有连续空闲进入 light sleep。
 // 恢复时会重新启动 tick 并整屏失效重绘。像素内容保持在上次熄灭时的一帧。
 void bsp_lvgl_set_suspended(bool suspend);
+
+// Stream RGB565 stripes into a full-width viewport while LVGL renders around it.
+// Tokens prevent a late worker from drawing over a different page. Call set/end
+// under the LVGL lock; draw acquires that lock itself and waits for SPI completion.
+bool bsp_lvgl_stream_set(int y, int height, uint32_t token);
+void bsp_lvgl_stream_end(uint32_t token);
+bool bsp_lvgl_stream_draw(uint32_t token, int x, int y, int width, int height,
+                          const uint16_t *rgb565_be);

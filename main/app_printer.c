@@ -1,6 +1,6 @@
 // main/app_printer.c —— 打印机状态主界面。
-// 页面(动态):0 进度(环形进度圈+大%) 1 温度
-//           2..2+AMS台数 AMS 料槽页(每台一页,2x2 槽) 设备(含 HMS) 控制(暂停/继续/停止/腔灯)。
+// Navigation: progress, camera, temperature, AMS, device, controls. Physical page
+// slots stay unchanged for legacy pages; slot 8 is the on-demand camera page.
 // 数据源:app_mqtt 快照 + bsp_battery;1 秒定时刷新,OK 键上下文操作。
 #include "app_printer.h"
 
@@ -12,6 +12,9 @@
 #include "app_mqtt.h"
 #include "app_notify.h"
 #include "app_wifi.h"
+#include "app_camera.h"
+#include "app_config.h"
+#include "bsp_display.h"
 #include "bsp_battery.h"
 #include "font_zh.h"
 #include "hms_codes.h"
@@ -19,7 +22,10 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-#define PAGE_MAX 8          // 最多 2(固定)+4(AMS)+1(设备)+1(控制)
+#define PAGE_MAX 9          // progress, camera, temperature, four AMS, device, control
+#define CAMERA_SLOT 8
+#define CAMERA_VIEW_Y 92
+#define CAMERA_VIEW_H 135
 #define MSG_MAX  48
 
 // 版面几何:上方 32..50 是常驻状态条(告警/云摘要),页面区从 52 起到屏底。
@@ -48,6 +54,7 @@ static lv_obj_t *s_pages[PAGE_MAX];
 static int s_pages_n;
 static int s_cur;
 static int s_midx;                 // 当前查看的机器下标(0..3)
+static int s_restore_slot = -1;    // AMS restore waits for the first printer report
 
 // ------------------------------------------------------------ 机器概览(多机列表)
 static bool s_ov_mode;      // true = 停留在机器列表(未进入详情)
@@ -60,7 +67,7 @@ static lv_obj_t *s_ov_pct[BAMBU_MACHINE_MAX];
 static lv_obj_t *s_ov_bar[BAMBU_MACHINE_MAX];
 static lv_obj_t *s_ov_state[BAMBU_MACHINE_MAX];
 static int s_ov_bar_w;
-static int s_slot[PAGE_MAX];   // 导航序号 → 实体页槽位(实体固定:0进度 1温度 2~5AMS 6设备 7控制)
+static int s_slot[PAGE_MAX];   // 0 progress, 8 camera, 1 temperature, 2..5 AMS, 6 device, 7 control
 static lv_timer_t *s_timer;
 static lv_timer_t *s_fast;     // 30ms 快速重绘:承接按键回调里延后的重绘请求
 static bool s_need_refresh;    // 按键触发的重绘请求(放到 LVGL 任务里执行)
@@ -70,7 +77,7 @@ static bool        s_pk_valid;
 static bool s_active;
 
 // 头部
-static lv_obj_t *s_time, *s_bat_pct, *s_bat_fill, *s_cloud_dot;
+static lv_obj_t *s_time, *s_bat_pct, *s_bat_fill, *s_bat_charge, *s_cloud_dot;
 static lv_obj_t *s_dots[PAGE_MAX];
 // 常驻状态条(有 HMS 时显示告警,否则显示云/WiFi 摘要)
 static lv_obj_t *s_bar, *s_bar_lbl;
@@ -103,12 +110,15 @@ static int64_t s_stop_armed_at;   // esp_timer us
 static bool s_light_on;           // 乐观腔灯状态
 
 // 上次打印状态(用于状态切换提示音)
-static char s_last_state[10];
 
 // 脏检查:数据快照没变时跳过整页重绘,只刷时钟/电量(省电、避免无谓重排)
 static bambu_state_t s_prev;
 static bool s_prev_valid;
 static bool s_dirty = true;       // 按键等交互强制重绘
+static lv_obj_t *s_cam_job, *s_cam_layer, *s_cam_age, *s_cam_model, *s_cam_state;
+static lv_obj_t *s_cam_pct, *s_cam_remain, *s_cam_fill, *s_cam_nozzle, *s_cam_bed;
+static lv_obj_t *s_cam_placeholder;
+static bool s_cam_had_image;
 
 static void refresh_all(void);    // 前向声明(tick_fast 要调,定义在后面)
 static void ov_refresh(void);     // 前向声明(refresh_all 概览模式要调)
@@ -118,6 +128,7 @@ static void ensure_ams_pages(int n); // 前向声明(refresh_all 随 AMS 数据�
 static void apply_page_vis(int show); // 前向声明(refresh_all 懒建页后收敛可见性)
 static void show_page(int idx);   // 前向声明(ov_key 进详情要调)
 static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev);
+static lv_obj_t *page_new(void);
 
 // 按键回调跑在 button 组件的小栈任务(默认 2~3KB)里,而翻页/重绘很重:
 // refresh_all() 会把 bambu_state_t 大结构体上栈 + memcpy + 一堆 LVGL/字体调用,
@@ -160,6 +171,16 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, uint32_t color,
     lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
     lv_obj_set_style_text_align(l, align, 0);
     return l;
+}
+
+static void remember_view(void) {
+    int machine = s_ov_mode ? s_ov_sel : s_midx;
+    const char *serial = app_mqtt_sn(machine);
+    if (!serial || !serial[0]) return;
+    printer_view_config_t view = {.version = 1, .overview = s_ov_mode,
+        .slot = s_ov_mode ? 0 : s_slot[s_cur]};
+    strlcpy(view.serial, serial, sizeof(view.serial));
+    config_printer_view_save(&view);
 }
 
 static void set_bar_pct(lv_obj_t *bar, int pct, int max_w)
@@ -268,6 +289,28 @@ static uint32_t state_ring_color(const char *st)
 
 // ------------------------------------------------------------ 头部
 
+static void battery_charge_draw(lv_event_t *event) {
+    lv_area_t area;
+    lv_obj_get_coords(lv_event_get_target(event), &area);
+    // Two overlapping triangles give both ends a sharp tip. The transparent
+    // object leaves the battery outline and its fill visible underneath.
+    static const lv_point_t points[2][3] = {
+        {{9, 0}, {0, 7}, {6, 7}},
+        {{4, 5}, {10, 5}, {1, 12}},
+    };
+    lv_draw_triangle_dsc_t triangle;
+    lv_draw_triangle_dsc_init(&triangle);
+    triangle.color = lv_color_hex(C_TEXT);
+    triangle.opa = LV_OPA_COVER;
+    for (int part = 0; part < 2; part++) {
+        for (int i = 0; i < 3; i++) {
+            triangle.p[i].x = area.x1 + points[part][i].x;
+            triangle.p[i].y = area.y1 + points[part][i].y;
+        }
+        lv_draw_triangle(lv_event_get_layer(event), &triangle);
+    }
+}
+
 static void header_build(void)
 {
     rect(s_scr, 0, 0, 240, 30, C_PANEL);
@@ -288,7 +331,7 @@ static void header_build(void)
         lv_obj_set_style_radius(s_dots[i], LV_RADIUS_CIRCLE, 0);
     }
 
-    // 电量:图标右置(210-236),百分比文字在图标左侧,互不重叠
+    // 电量:保持原电池尺寸和百分比位置,只放大透明闪电。
     s_bat_pct = label(s_scr, &lv_font_montserrat_14, C_DIM, LV_TEXT_ALIGN_RIGHT);
     lv_label_set_text(s_bat_pct, "-");
     lv_obj_align(s_bat_pct, LV_ALIGN_TOP_RIGHT, -34, 7);
@@ -301,6 +344,13 @@ static void header_build(void)
     s_bat_fill = rect(body, 0, 0, 10, 9, C_GREEN);
     lv_obj_set_style_radius(s_bat_fill, 0, 0);
     rect(s_scr, 236, 12, 3, 7, C_DIM);
+
+    // Enlarge only the bolt, preserving the original battery outline and fill.
+    // Draw vectors directly; there is no font bearing or opaque icon backdrop.
+    s_bat_charge = rect(s_scr, 216, 9, 11, 13, C_BG);
+    lv_obj_set_style_bg_opa(s_bat_charge, LV_OPA_TRANSP, 0);
+    lv_obj_add_event_cb(s_bat_charge, battery_charge_draw, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_set_hidden(s_bat_charge, true);
 }
 
 // 常驻状态条(header 下方 18px):有 HMS 显示告警,否则显示云/WiFi 摘要。
@@ -471,6 +521,88 @@ static void refresh_progress(const bambu_state_t *st)
 }
 
 // ------------------------------------------------------------ 温度页
+
+static void page_camera_build(lv_obj_t *p) {
+    s_cam_layer = label(p, &font_zh14, C_CYAN, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_set_pos(s_cam_layer, 138, 22); lv_obj_set_width(s_cam_layer, 90);
+    s_cam_job = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_cam_job, 12, 0); lv_obj_set_width(s_cam_job, 216);
+    lv_label_set_long_mode(s_cam_job, LV_LABEL_LONG_DOT);
+    lv_obj_t *viewport = rect(p, 0, CAMERA_VIEW_Y-PAGE_Y, 240, CAMERA_VIEW_H, C_PANEL2);
+    s_cam_placeholder = label(viewport, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_width(s_cam_placeholder, 224); lv_label_set_text(s_cam_placeholder, "Connecting camera...");
+    lv_obj_center(s_cam_placeholder);
+    s_cam_age = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_cam_age, 12, 178); lv_obj_set_width(s_cam_age, 144);
+    lv_label_set_long_mode(s_cam_age, LV_LABEL_LONG_DOT);
+    s_cam_model = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_set_pos(s_cam_model, 158, 178); lv_obj_set_width(s_cam_model, 70);
+    lv_label_set_long_mode(s_cam_model, LV_LABEL_LONG_DOT);
+    s_cam_state = label(p, &font_zh14, C_GREEN, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_cam_state, 12, 200); lv_obj_set_width(s_cam_state, 56);
+    s_cam_pct = label(p, &lv_font_montserrat_20, C_TEXT, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_cam_pct, 69, 196); lv_obj_set_width(s_cam_pct, 58);
+    s_cam_remain = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_set_pos(s_cam_remain, 130, 200); lv_obj_set_width(s_cam_remain, 98);
+    rect(p, 12, 224, 216, 4, C_LINE);
+    s_cam_fill = rect(p, 12, 224, 0, 4, C_GREEN);
+    lv_obj_t *key;
+    chip_build(p, 12, 237, 104, 22, "喷嘴", C_ORANGE, &key, &s_cam_nozzle);
+    chip_build(p, 124, 237, 104, 22, "热床", C_GREEN_L, &key, &s_cam_bed);
+}
+
+static void refresh_camera(const bambu_state_t *st) {
+    camera_state_t camera;
+    app_camera_snapshot(&camera);
+    uint32_t color;
+    const char *state = state_zh(st->gcode_state, &color);
+    bool printing = !strcmp(st->gcode_state, "RUNNING") || !strcmp(st->gcode_state, "PAUSE");
+    bool progress = printing || !strcmp(st->gcode_state, "FINISH") || !strcmp(st->gcode_state, "FAILED");
+    lv_label_set_text(s_cam_state, state);
+    lv_obj_set_style_text_color(s_cam_state, lv_color_hex(color), 0);
+    lv_label_set_text(s_cam_job, progress && st->job[0] ? st->job : "等待任务");
+    char text[48];
+    if (st->total_layer > 0 && progress) snprintf(text, sizeof(text), "%d/%d 层", st->layer, st->total_layer);
+    else strlcpy(text, "--/-- 层", sizeof(text));
+    lv_label_set_text(s_cam_layer, text);
+    if (progress) snprintf(text, sizeof(text), "%d%%", st->pct);
+    else strlcpy(text, "--", sizeof(text));
+    lv_label_set_text(s_cam_pct, text);
+    if (printing && st->remain_min > 0) snprintf(text, sizeof(text), "剩余 %dh%02dm", st->remain_min/60, st->remain_min%60);
+    else strlcpy(text, "--", sizeof(text));
+    lv_label_set_text(s_cam_remain, text);
+    set_bar_pct(s_cam_fill, progress ? st->pct : 0, 216);
+    lv_obj_set_style_bg_color(s_cam_fill, lv_color_hex(color), 0);
+    snprintf(text, sizeof(text), "%d°", st->nozzle_t); lv_label_set_text(s_cam_nozzle, text);
+    snprintf(text, sizeof(text), "%d°", st->bed_t); lv_label_set_text(s_cam_bed, text);
+    lv_label_set_text(s_cam_model, camera.model[0] ? camera.model :
+        (app_mqtt_name(s_midx) ? app_mqtt_name(s_midx) : "Printer"));
+    const char *hint = NULL;
+    switch (camera.status) {
+    case CAMERA_UNCONFIGURED: hint = "Set camera in WiFi setup"; break;
+    case CAMERA_UNSUPPORTED: hint = "Camera format unsupported"; break;
+    case CAMERA_IDENTITY_ERROR: hint = "Camera identity changed"; break;
+    case CAMERA_MEMORY_ERROR: hint = "Camera needs free memory"; break;
+    case CAMERA_RETRYING: hint = "Camera reconnecting..."; break;
+    default: hint = "Connecting camera..."; break;
+    }
+    if (camera.has_image) {
+        int age = (esp_timer_get_time()-camera.updated_us)/1000000;
+        bool stale = age > 12 || camera.status != CAMERA_READY;
+        snprintf(text, sizeof(text), stale ? "%ds old - retrying" : "%ds ago", age);
+        lv_label_set_text(s_cam_age, text);
+        lv_obj_set_style_text_color(s_cam_age, lv_color_hex(stale ? C_YELLOW : C_DIM), 0);
+        lv_obj_add_flag(s_cam_placeholder, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(s_cam_age, camera.status == CAMERA_UNCONFIGURED ? "Not configured" : "Waiting for image");
+        lv_obj_set_style_text_color(s_cam_age, lv_color_hex(C_DIM), 0);
+        lv_label_set_text(s_cam_placeholder, hint);
+        lv_obj_remove_flag(s_cam_placeholder, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_center(s_cam_placeholder);
+        if (s_cam_had_image) lv_obj_invalidate(s_pages[CAMERA_SLOT]);
+    }
+    s_cam_had_image = camera.has_image;
+}
 
 static void page_temp_build(lv_obj_t *p)
 {
@@ -933,6 +1065,7 @@ static void refresh_header(const bambu_state_t *st)
     uint32_t fc = soc > 50 ? C_GREEN : (soc > 20 ? C_YELLOW : C_RED);
     lv_obj_set_width(s_bat_fill, (soc < 0 ? 0 : soc) * 20 / 100);   // 电池内部净宽 20
     lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(fc), 0);
+    lv_obj_set_hidden(s_bat_charge, !bsp_battery_usb_connected());
 }
 
 static void refresh_all(void)
@@ -950,45 +1083,58 @@ static void refresh_all(void)
     if (changed) { s_prev = st; s_prev_valid = true; }
 
     // 动态页数:2 固定 + AMS 台数;已收到数据但 ams_count=0(外部料筒)也保留 1 页
+    int previous_slot = s_slot[s_cur];
+    int wanted_slot = s_restore_slot >= 0 ? s_restore_slot : previous_slot;
     int ams_pages = st.ams_count;
     if (ams_pages > 4) ams_pages = 4;
     if (ams_pages == 0 && st.gcode_state[0]) ams_pages = 1;
-    ensure_ams_pages(ams_pages);   // 只建用得到的 AMS 页,省 LVGL 池(新建页默认隐藏)
+    if (s_restore_slot >= 0) {
+        if (wanted_slot >= 2 && wanted_slot <= 5 && !st.gcode_state[0]) {
+            // Do not mistake an empty startup snapshot for a removed AMS.
+            if (ams_pages < wanted_slot - 1) ams_pages = wanted_slot - 1;
+        } else {
+            s_restore_slot = -1;
+        }
+    }
+    if (wanted_slot != CAMERA_SLOT) ensure_ams_pages(ams_pages);
     // 导航序 → 实体槽位:进度/温度固定,AMS 只取前 ams_pages 个,设备/控制固定 6/7
     {
         int n = 0;
         s_slot[n++] = 0;
+        s_slot[n++] = CAMERA_SLOT;
         s_slot[n++] = 1;
         for (int i = 0; i < ams_pages; i++) s_slot[n++] = 2 + i;
         s_slot[n++] = 6;                 // 设备页实体
         s_slot[n++] = 7;                 // 控制页实体
         s_pages_n = n;                   // = 2 + ams + 设备 + 控制
     }
-    if (s_cur >= s_pages_n) s_cur = s_pages_n - 1;
-    if (s_cur < 0) s_cur = 0;
+    // Retain page identity when AMS reports add/remove navigation entries.
+    s_cur = 0;
+    for (int i = 0; i < s_pages_n; i++) {
+        if (s_slot[i] == wanted_slot) { s_cur = i; break; }
+    }
     apply_page_vis(s_slot[s_cur]);       // 懒建页后重新收敛可见性(只留当前页)
-    int dev_idx = 2 + ams_pages;
+    if (previous_slot != s_slot[s_cur]) {
+        s_dirty = true;
+        ESP_LOGI("printer", "page=%d slot=%d", s_cur+1, s_slot[s_cur]);
+        if (s_restore_slot < 0) remember_view();
+    }
+    int dev_idx = 3 + ams_pages;
     int ctl_idx = dev_idx + 1;
 
     refresh_header(&st);
+    if (s_slot[s_cur] == CAMERA_SLOT) refresh_camera(&st);
     if (!changed && !s_dirty && !s_stop_armed) return;
     s_dirty = false;
 
-    // 状态切换提示音(完成/失败/暂停)
-    if (s_last_state[0] && strcmp(s_last_state, st.gcode_state)) {
-        if (!strcmp(st.gcode_state, "FINISH"))  app_notify_trigger(NOTIFY_FINISH);
-        else if (!strcmp(st.gcode_state, "FAILED")) app_notify_trigger(NOTIFY_FAIL);
-        else if (!strcmp(st.gcode_state, "PAUSE"))  app_notify_trigger(NOTIFY_PAUSE);
-    }
-    strlcpy(s_last_state, st.gcode_state[0] ? st.gcode_state : "IDLE", sizeof(s_last_state));
-
     refresh_status_bar(&st);
 
-    switch (s_cur) {
+    switch (s_slot[s_cur]) {
     case 0: refresh_progress(&st); break;
     case 1: refresh_temp(&st); break;
+    case CAMERA_SLOT: break;
     default:
-        if (s_cur >= 2 && s_cur < dev_idx) refresh_ams(&st, s_cur - 2, ams_pages);
+        if (s_cur >= 3 && s_cur < dev_idx) refresh_ams(&st, s_slot[s_cur] - 2, ams_pages);
         else if (s_cur == dev_idx)         refresh_device(&st);
         else if (s_cur == ctl_idx)         ctl_refresh_items(&st);
         break;
@@ -1142,6 +1288,7 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     } else if (btn == BSP_BTN_OK) {
         // 进入选中机器的详情:删概览页释放内存,按需建详情页
         s_midx = s_ov_sel;
+        s_restore_slot = -1;
         s_ov_mode = false;
         if (s_ov_page) { lv_obj_delete(s_ov_page); s_ov_page = NULL; }
         detail_build();
@@ -1151,6 +1298,7 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         show_page(0);
         return;
     }
+    remember_view();
     request_refresh();
 }
 
@@ -1159,6 +1307,21 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 // 只显示 show 对应的实体页,其余全部隐藏(NULL = 未建的 AMS 页,跳过)
 static void apply_page_vis(int show)
 {
+    if (show == CAMERA_SLOT && !s_pages[CAMERA_SLOT]) {
+        // Camera widgets replace hidden detail widgets instead of increasing
+        // the LVGL pool. The original pages are rebuilt when leaving camera.
+        for (int i = 0; i < CAMERA_SLOT; i++) {
+            if (s_pages[i]) { lv_obj_delete(s_pages[i]); s_pages[i] = NULL; }
+        }
+        s_pages[CAMERA_SLOT] = page_new();
+        page_camera_build(s_pages[CAMERA_SLOT]);
+        s_cam_had_image = false;
+        app_camera_start(s_midx, 0, CAMERA_VIEW_Y, 240, CAMERA_VIEW_H);
+    } else if (show != CAMERA_SLOT && s_pages[CAMERA_SLOT]) {
+        app_camera_stop();
+        lv_obj_delete(s_pages[CAMERA_SLOT]); s_pages[CAMERA_SLOT] = NULL;
+        detail_build();
+    }
     for (int i = 0; i < PAGE_MAX; i++) {
         if (!s_pages[i]) continue;
         if (i == show) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
@@ -1176,6 +1339,8 @@ static void show_page(int idx)
     int show = (idx >= 0 && idx < s_pages_n && idx < PAGE_MAX) ? s_slot[idx] : 0;
     apply_page_vis(show);
     s_cur = idx;
+    ESP_LOGI("printer", "page=%d slot=%d", idx+1, show);
+    remember_view();
     s_stop_armed = false;   // 切页取消停止确认
     request_refresh();      // 延到 LVGL 任务里重绘(不在按键回调里干重活)
 }
@@ -1224,6 +1389,7 @@ static void detail_build(void)
 
 static void detail_free(void)
 {
+    app_camera_stop();
     for (int i = 0; i < PAGE_MAX; i++) {
         if (s_pages[i]) { lv_obj_delete(s_pages[i]); s_pages[i] = NULL; }
     }
@@ -1247,13 +1413,23 @@ void app_printer_enter(void)
     s_ov_page = NULL;
     int mcnt = app_mqtt_machine_count();
     s_ov_sel = 0;
-    if (mcnt >= 2) {
+    printer_view_config_t saved;
+    int saved_machine = -1;
+    if (config_printer_view_load(&saved)) {
+        for (int i = 0; i < mcnt; i++) {
+            const char *serial = app_mqtt_sn(i);
+            if (serial && !strcmp(serial, saved.serial)) { saved_machine = i; break; }
+        }
+    }
+    s_restore_slot = -1;
+    s_midx = saved_machine >= 0 ? saved_machine : 0;
+    if (mcnt >= 2 && (saved_machine < 0 || saved.overview)) {
         s_ov_mode = true;
-        s_midx = 0;
+        s_ov_sel = s_midx;
         ov_build();
     } else {
         s_ov_mode = false;
-        s_midx = 0;
+        if (saved_machine >= 0) s_restore_slot = saved.slot;
         detail_build();
     }
 
@@ -1262,19 +1438,24 @@ void app_printer_enter(void)
     s_ctl_sel = 0;
     s_stop_armed = false;
     s_light_on = false;
-    s_last_state[0] = 0;
     s_prev_valid = false;    // 重进页面时强制整页重绘
     s_dirty = true;
     s_active = true;
     s_timer = lv_timer_create(tick_1s, 1000, NULL);
     s_fast  = lv_timer_create(tick_fast, 30, NULL);   // 承接按键延后的重绘
-    s_slot[0] = 0; s_slot[1] = 1; s_slot[2] = 6; s_slot[3] = 7;  // 默认(还没 AMS 数据)
-    s_pages_n = 4;
+    s_slot[0] = 0; s_slot[1] = CAMERA_SLOT; s_slot[2] = 1; s_slot[3] = 6; s_slot[4] = 7;
+    s_pages_n = 5;
     s_need_refresh = false;
     s_pk_valid = false;      // 丢弃进入前残留的按键
 
-    if (s_ov_mode) ov_refresh();
-    else           show_page(0);
+    if (s_ov_mode) {
+        ov_refresh();
+        remember_view();
+    } else {
+        // Resolve stable page types before showing the first frame.
+        refresh_all();
+        show_page(s_cur);
+    }
 
     lv_screen_load(s_scr);
     // 诊断:LVGL 内置内存池(默认 48KB)使用情况,排查对象创建超池导致卡死
@@ -1291,6 +1472,7 @@ void app_printer_exit(void)
 {
     if (!s_scr) return;
     s_active = false;
+    app_camera_stop();
     if (s_timer) { lv_timer_delete(s_timer); s_timer = NULL; }
     if (s_fast)  { lv_timer_delete(s_fast);  s_fast  = NULL; }
     s_need_refresh = false;
@@ -1322,11 +1504,13 @@ static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev)
             detail_free();
             ov_build();
             ov_refresh();
+            remember_view();
         }
         return;   // 单机时交给上层返回菜单
     }
 
     if (ev == BSP_BTN_CLICK) {
+        if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) s_restore_slot = -1;
         s_dirty = true;      // 交互必重绘(数据可能没变,但选中项/显示模式变了)
         // 控制页:上下=选择,顶/底溢出=翻页;OK=执行
         bool in_ctl = (s_cur == s_pages_n - 1);
@@ -1345,7 +1529,9 @@ static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev)
                 show_page((s_cur + 1) % s_pages_n);
             }
         } else if (btn == BSP_BTN_OK) {
-            if (s_cur == 0) {
+            if (s_slot[s_cur] == CAMERA_SLOT) {
+                app_camera_refresh();
+            } else if (s_cur == 0) {
                 s_show_eta = !s_show_eta;      // 进度页:切换剩余/完成
                 refresh_all();
             } else if (in_ctl) {
@@ -1380,6 +1566,7 @@ static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev)
 void app_printer_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 {
     if (!s_scr) return;
+    if (ev != BSP_BTN_CLICK && ev != BSP_BTN_LONG) return;
     s_pk_btn = btn; s_pk_ev = ev; s_pk_valid = true;
 }
 

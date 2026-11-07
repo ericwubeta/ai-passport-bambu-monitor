@@ -1,0 +1,10 @@
+menu "Printer camera"
+    config CAMERA_START_ON_SECOND_PAGE
+        bool "Open camera page at startup (single printer, diagnostic builds)"
+        default n
+    config CAMERA_GEOMETRY_SELFTEST
+        bool "Run camera geometry self-tests at boot"
+        default n
+        help
+            Exercise 16:9, 4:3, portrait, small JPEGs, and pixel mapping on-device.
+endmenu

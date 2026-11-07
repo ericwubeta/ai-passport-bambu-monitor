@@ -5,6 +5,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define CFG_NVS_NS "aipass"          // NVS 命名空间
 #define CFG_MACHINE_MAX 4            // 同账号最多 4 台打印机
@@ -38,3 +39,15 @@ bool config_is_provisioned(void);
 
 // 标记配网完成。
 void config_mark_provisioned(void);
+
+// Last printer view, stored separately from account/network configuration.
+// slot is the stable physical page type, not its changing navigation index.
+typedef struct {
+    uint8_t version;
+    uint8_t slot;
+    uint8_t overview;
+    char serial[34];
+} printer_view_config_t;
+
+bool config_printer_view_load(printer_view_config_t *view);
+bool config_printer_view_save(const printer_view_config_t *view);

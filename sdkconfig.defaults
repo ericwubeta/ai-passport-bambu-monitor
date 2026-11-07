@@ -42,6 +42,9 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # 握手结束后释放配置里的证书/CA 副本,给数据阶段的 11.7KB TLS record 让出连续内存。
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+# Certificate identity / trust is checked during handshake. Neither the camera
+# leaf-pinning callback nor MQTT needs retained peer certificate chains.
+# CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is not set
 
 # C3 无 PSRAM:无线驱动默认 32 个动态收/发缓冲会长期占满内部 RAM,
 # 导致 11.7KB 的 TLS record 找不到连续空间。降到 16 仍够 2.4GHz 单连接监控使用。

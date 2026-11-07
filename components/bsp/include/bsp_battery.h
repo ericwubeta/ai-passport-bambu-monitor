@@ -4,6 +4,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 
 // 初始化。内部会调 bsp_i2c_init()(幂等)。
 // 芯片不应答时返回 ESP_ERR_NOT_FOUND —— 上层可据此在 UI 上标记该项不可用。
@@ -18,3 +19,8 @@ int bsp_battery_soc(void);
 
 // 电池电压 mV;读失败返回 -1。
 int bsp_battery_mv(void);
+
+// Positive evidence of external USB power: a USB host is sending SOF packets.
+// This board exposes no charger-status/VBUS input. A wall charger or power bank
+// cannot be detected with this API; true does not measure battery charge current.
+bool bsp_battery_usb_connected(void);

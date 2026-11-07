@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+set(IDF_TARGET esp32c3)
+if(NOT PROBE_PRIVATE_DIR)
+    message(FATAL_ERROR "PROBE_PRIVATE_DIR must contain the ignored camera_probe_private.h")
+endif()
+set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(passport_camera_probe)
