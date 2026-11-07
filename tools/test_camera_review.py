@@ -48,10 +48,14 @@ class CameraReviewTests(unittest.TestCase):
         cls.executables = {}
         sources = {name: (ROOT / "main" / f"app_{name}.c").read_text(encoding="utf-8")
                    for name in ["camera", "mqtt", "printer", "config", "provision"]}
+        main = (ROOT / "main/main.c").read_text(encoding="utf-8")
         reader = re.search(r"typedef struct \{.*?\} camera_reader_t;", sources["camera"], re.S).group()
         mqtt = sources["mqtt"][sources["mqtt"].index("static void sanitize_job"):sources["mqtt"].index("static void push_pushall")]
         roster = "\n".join(function(sources["config"], name) for name in ["config_machine_count", "config_load_printers"])
         for kind, replacements in {
+            "power": {"PRINTING": function(sources["mqtt"], "app_mqtt_any_printing"),
+                      "WAKE": function(main, "screen_wake"), "TICK": function(main, "screen_off_tick"),
+                      "KEY": function(main, "screen_off_on_key")},
             "worker": {"READER": reader, "CURRENT": function(sources["camera"], "current"),
                        "STATUS": function(sources["camera"], "status"), "WORKER": function(sources["camera"], "worker")},
             "pin": {"READER": reader, "CURRENT": function(sources["camera"], "current"),
@@ -85,6 +89,30 @@ class CameraReviewTests(unittest.TestCase):
 
     def test_offline_poll_retains_verified_image(self):
         self.run_case("worker", "offline")
+
+    def test_inactive_print_states_sleep_with_or_without_usb(self):
+        self.run_case("power", "inactive")
+
+    def test_finishing_starts_idle_timeout_while_powered(self):
+        self.run_case("power", "finish")
+
+    def test_unplugging_running_print_starts_idle_timeout(self):
+        self.run_case("power", "unplug")
+
+    def test_running_print_on_battery_still_sleeps(self):
+        self.run_case("power", "battery")
+
+    def test_any_configured_printing_machine_keeps_powered_screen_on(self):
+        self.run_case("power", "multi")
+
+    def test_stale_or_uninitialized_printing_state_does_not_keep_awake(self):
+        self.run_case("power", "offline")
+
+    def test_usb_attach_wakes_only_when_printing(self):
+        self.run_case("power", "wake")
+
+    def test_key_wake_resumes_camera_and_consumes_delayed_click(self):
+        self.run_case("power", "key")
 
     def test_pin_save_failure_retries_until_persisted(self):
         self.run_case("pin", "retry")

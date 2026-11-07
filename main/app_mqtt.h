@@ -79,6 +79,10 @@ void app_mqtt_request_now(int idx);
 // 线程安全取第 idx 台机器的状态快照。从未收到过数据时 cloud 为 OFF/CONNECTING。
 void app_mqtt_snapshot(int idx, bambu_state_t *out);
 
+// True when any configured printer has cloud-online RUNNING state. Paused,
+// completed, failed and unknown/offline states do not keep the screen awake.
+bool app_mqtt_any_printing(void);
+
 // 云连接已维持的秒数(设备页显示用)。
 int app_mqtt_uptime_sec(void);
 

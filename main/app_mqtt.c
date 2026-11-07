@@ -822,6 +822,22 @@ void app_mqtt_set_chamber_light(int idx, bool on)
     publish_request(idx, payload, 0);
 }
 
+bool app_mqtt_any_printing(void)
+{
+    if (!s_lock) return false;
+    bool printing = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_mcount; i++) {
+        if (s_state[i].cloud == BAMBU_CLOUD_ONLINE &&
+            !strcmp(s_state[i].gcode_state, "RUNNING")) {
+            printing = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return printing;
+}
+
 void app_mqtt_snapshot(int idx, bambu_state_t *out)
 {
     if (!out) return;

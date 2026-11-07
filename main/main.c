@@ -110,14 +110,15 @@ static void screen_off_tick(void *arg)
         usb_was_connected = usb_connected;
         ESP_LOGI(TAG, "USB host power=%d, screen_off=%d", usb_connected, s_screen_off);
     }
-    if (usb_connected) {
-        // Refresh the idle deadline so unplugging starts a new 30-second wait.
+    if (usb_connected && app_mqtt_any_printing()) {
+        // Only a powered, running print keeps the screen awake. Finishing,
+        // pausing or unplugging starts a new 30-second idle interval.
         s_key_us = esp_timer_get_time();
         screen_wake();
         return;
     }
-    // Use precisely the same power signal as the charging bolt. A camera page
-    // (or setup page) must not override the idle timeout on battery power.
+    // Power alone is not activity. All pages share the idle timeout when
+    // there is no running print, including camera and setup pages.
     if (s_screen_off) return;
     if (esp_timer_get_time() - s_key_us < 30LL * 1000 * 1000) return;
     if (!bsp_lvgl_lock(200)) return;
@@ -128,7 +129,7 @@ static void screen_off_tick(void *arg)
 #if CONFIG_PM_ENABLE
     if (s_awake_lock) esp_pm_lock_release(s_awake_lock);   // 画面已冻结,允许入睡
 #endif
-    // Keep the one-second power check alive while dark to handle USB attach.
+    // Keep checking while dark: a running print with USB power can wake it.
     s_screen_off = true;
     bsp_lvgl_unlock();
     ESP_LOGI(TAG, "空闲 30s,熄屏");
