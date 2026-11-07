@@ -7,6 +7,7 @@ idf_component_register(
          "app_mqtt.c"
          "app_notify.c"
          "app_notify_transition.c"
+         "app_screen_policy.c"
          "app_boot.c"
          "app_printer.c"
          "app_config.c"

@@ -1,8 +1,10 @@
 #include "camera_review_common.h"
 #include "app_mqtt.h"
 #include "app_notify.h"
+#include "app_screen_policy.h"
 static bambu_state_t s_state[BAMBU_MACHINE_MAX], s_prev;
 static bool s_ever_data[BAMBU_MACHINE_MAX];
+static atomic_uint s_screen_wake_sequence;
 static int s_lock;
 #define xSemaphoreTake(...) 1
 #define xSemaphoreGive(...) ((void)0)

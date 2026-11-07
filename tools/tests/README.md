@@ -32,7 +32,13 @@ The firmware regression cases cover:
 - Screen idle timeout on USB and battery across inactive, paused, finished,
   failed, unknown, offline and running states; print completion and unplugging;
   activity on another configured printer; key wake and camera resume; plugging
-  in while idle remaining dark and a powered running print waking the display.
+  in while idle waking once. The actual MQTT parser, wake event sequence, both
+  independent screen policy state machines and display callbacks are exercised
+  together. Cases cover start/finish events on both power sources, baseline and
+  duplicate reports, reconnect/stateless telemetry, another printer and resume,
+  event/timeout priority, display-lock retries, deadline reset while already lit,
+  coalesced events and sequence wrap. Display wake does not depend on sound
+  notification classification.
 
 The six tests in `test_probe_camera_snapshot.py` exercise the host-side protocol
 probe separately. These checks do not replace an ESP-IDF build or real-device

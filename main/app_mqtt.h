@@ -83,6 +83,10 @@ void app_mqtt_snapshot(int idx, bambu_state_t *out);
 // completed, failed and unknown/offline states do not keep the screen awake.
 bool app_mqtt_any_printing(void);
 
+// Monotonic event sequence for observed RUNNING entry / active -> FINISH.
+// Initial and duplicate snapshots do not advance it; independent of UI/power.
+uint32_t app_mqtt_screen_wake_sequence(void);
+
 // 云连接已维持的秒数(设备页显示用)。
 int app_mqtt_uptime_sec(void);
 

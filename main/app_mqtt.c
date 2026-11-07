@@ -9,8 +9,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "app_config.h"
 #include "app_notify.h"
+#include "app_screen_policy.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -41,6 +43,7 @@ static SemaphoreHandle_t s_lock;
 static bambu_state_t s_state[BAMBU_MACHINE_MAX];   // 每台机器独立状态槽
 static int64_t s_conn_since;      // 云连接建立的时间戳(us)
 static bool s_ever_data[BAMBU_MACHINE_MAX];
+static atomic_uint s_screen_wake_sequence;
 
 // 凭据:NVS(配网写入)优先,空则回落 secrets.h。app_mqtt_start 时解析一次。
 static char s_uid[40];            // "u_<USER_ID>"
@@ -369,6 +372,11 @@ static void parse_report(int idx, const char *data, int len)
             if (jstr(v, ve, gs, sizeof(gs)) && gs[0]) {
                 notification = app_notify_transition(st->gcode_state, gs);
                 bool changed = strcmp(st->gcode_state, gs) != 0;
+                // Initial snapshots establish a baseline. Only subsequent
+                // entry into RUNNING or an active -> FINISH transition wakes.
+                if (screen_print_wake_transition(st->gcode_state, gs)) {
+                    atomic_fetch_add_explicit(&s_screen_wake_sequence, 1, memory_order_relaxed);
+                }
                 strlcpy(st->gcode_state, gs, sizeof(st->gcode_state));
                 // 状态切换到 IDLE / FINISH / FAILED 且不再是打印中:
                 // 清空残留的旧进度/层数/温度/任务,避免界面出现"空闲 + 53%"这种矛盾。
@@ -820,6 +828,11 @@ void app_mqtt_set_chamber_light(int idx, bool on)
              "\"led_node\":\"chamber_light\",\"led_mode\":\"%s\"}}",
              (unsigned)esp_random(), on ? "on" : "off");
     publish_request(idx, payload, 0);
+}
+
+uint32_t app_mqtt_screen_wake_sequence(void)
+{
+    return atomic_load_explicit(&s_screen_wake_sequence, memory_order_relaxed);
 }
 
 bool app_mqtt_any_printing(void)
