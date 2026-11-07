@@ -34,6 +34,7 @@ static const char *TAG = "main";
 static int64_t s_key_us;
 static bool    s_screen_off;
 static bool    s_swallow_key;
+static bool    s_swallow_released;
 static esp_timer_handle_t s_scr_timer;
 
 #if CONFIG_PM_ENABLE
@@ -84,16 +85,20 @@ static void pm_init(void)
 }
 #endif
 
-static void screen_wake(void)
+static bool screen_wake(void)
 {
-    if (!s_screen_off) return;
-    s_screen_off = false;
+    if (!s_screen_off) return true;
+    if (!bsp_lvgl_lock(200)) return false;
 #if CONFIG_PM_ENABLE
     if (s_awake_lock) esp_pm_lock_acquire(s_awake_lock);
 #endif
     // Resume rendering before lighting the panel, as with a key wake.
+    app_printer_set_suspended(false);
     bsp_lvgl_set_suspended(false);
     bsp_display_backlight(100);
+    s_screen_off = false;
+    bsp_lvgl_unlock();
+    return true;
 }
 
 static void screen_off_tick(void *arg)
@@ -111,8 +116,12 @@ static void screen_off_tick(void *arg)
         screen_wake();
         return;
     }
-    if (s_screen_off || app_provision_needed() || app_camera_active()) return;
+    // Use precisely the same power signal as the charging bolt. A camera page
+    // (or setup page) must not override the idle timeout on battery power.
+    if (s_screen_off) return;
     if (esp_timer_get_time() - s_key_us < 30LL * 1000 * 1000) return;
+    if (!bsp_lvgl_lock(200)) return;
+    app_printer_set_suspended(true);
     bsp_display_backlight(0);
     // 熄屏后停掉 LVGL 的 5ms tick 与全部 lv_timer,CPU 才有连续空闲进入 light sleep。
     bsp_lvgl_set_suspended(true);
@@ -121,6 +130,7 @@ static void screen_off_tick(void *arg)
 #endif
     // Keep the one-second power check alive while dark to handle USB attach.
     s_screen_off = true;
+    bsp_lvgl_unlock();
     ESP_LOGI(TAG, "空闲 30s,熄屏");
 }
 
@@ -139,13 +149,25 @@ static bool screen_off_on_key(bsp_btn_ev_t ev)
 {
     s_key_us = esp_timer_get_time();
     if (s_screen_off) {
-        screen_wake();
-        ESP_LOGI(TAG, "按键唤醒,亮屏");
-        if (ev != BSP_BTN_RELEASE) s_swallow_key = true;
+        if (screen_wake()) {
+            ESP_LOGI(TAG, "按键唤醒,亮屏");
+            if (ev != BSP_BTN_RELEASE) {
+                s_swallow_key = true;
+                s_swallow_released = false;
+            }
+        }
         return true;
     }
     if (s_swallow_key) {
-        if (ev == BSP_BTN_RELEASE) s_swallow_key = false;
+        // SINGLE_CLICK follows RELEASE after the button's click timeout.
+        // Swallow that delayed action too, so waking does not change pages.
+        if (ev == BSP_BTN_CLICK || ev == BSP_BTN_DOUBLE) s_swallow_key = false;
+        else if (ev == BSP_BTN_RELEASE) s_swallow_released = true;
+        else if (ev == BSP_BTN_PRESS && s_swallow_released) {
+            s_swallow_key = false;
+            s_swallow_released = false;
+            return false;
+        }
         return true;
     }
     return false;

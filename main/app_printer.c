@@ -1468,6 +1468,12 @@ void app_printer_enter(void)
     refresh_all();
 }
 
+void app_printer_set_suspended(bool suspended) {
+    if (!s_scr || s_ov_mode || s_slot[s_cur] != CAMERA_SLOT) return;
+    if (suspended) app_camera_stop();
+    else app_camera_start(s_midx, 0, CAMERA_VIEW_Y, 240, CAMERA_VIEW_H);
+}
+
 void app_printer_exit(void)
 {
     if (!s_scr) return;
