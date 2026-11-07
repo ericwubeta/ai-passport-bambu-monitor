@@ -25,6 +25,10 @@ typedef struct {
 // 兼容旧数据:老版本 bambu_sn 单键迁移到槽 0。
 bool config_load(device_config_t *cfg);
 
+// Read the effective printer roster: NVS first, then the legacy compiled serial
+// only when every NVS printer slot is empty. Does not write or migrate NVS.
+bool config_load_printers(device_config_t *cfg);
+
 // 写回完整配置(配网成功后调用)。返回是否全部写入成功。
 bool config_save(const device_config_t *cfg);
 

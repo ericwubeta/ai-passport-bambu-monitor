@@ -61,6 +61,7 @@ typedef struct {
 
     bambu_ams_t ams[BAMBU_AMS_MAX];
     int   ams_count;         // 在位 AMS 台数(0=外部料筒或未知)
+    bool  ams_topology_known; // 已收到明确的 AMS 数组（包括空数组），不是普通状态增量
     bool  ams_active;        // true=AMS 当前料槽;false=外部料筒
     bambu_hms_t hms[BAMBU_HMS_MAX];
     int   hms_count;         // 当前 HMS 错误数(0=无)

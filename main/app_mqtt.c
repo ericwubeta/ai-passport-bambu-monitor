@@ -83,6 +83,7 @@ static void state_reset_online_part(bambu_state_t *st)
     st->job[0] = 0;
     st->printer_ip = 0;
     st->ams_count = 0;
+    st->ams_topology_known = false;
     st->ams_active = false;
     memset(st->ams, 0, sizeof(st->ams));
     st->hms_count = 0;
@@ -340,6 +341,12 @@ static bool jstr(const char *v, const char *ve, char *out, int n)
         if (_v) (dst) = jint(_v, _e, (dst)); \
     } while (0)
 
+static bool jarray(const char *value, const char *end) {
+    if (!value || !end) return false;
+    value = jskip_ws(value, end);
+    return value < end && *value == '[' && end[-1] == ']';
+}
+
 static void parse_report(int idx, const char *data, int len)
 {
     bambu_state_t *const st = &s_state[idx];
@@ -419,10 +426,15 @@ static void parse_report(int idx, const char *data, int len)
         // 闪没(全量 pushall 每 30 秒才来一次),故先探测再清。
         {
             const char *ae0 = NULL;
-            bool has_ams = jpath(pr, plen, "ams.ams[0]", &ae0) != NULL;
-            if (!has_ams) has_ams = jpath(pr, plen, "ams[0]", &ae0) != NULL;
+            const char *array = jpath(pr, plen, "ams.ams", &ae0);
+            bool has_ams = jarray(array, ae0);
+            if (!has_ams) {
+                array = jpath(pr, plen, "ams", &ae0);
+                has_ams = jarray(array, ae0);
+            }
 
             if (has_ams) {
+            st->ams_topology_known = true;
             int tray_now = 255;
             v = jpath(pr, plen, "ams.tray_now", &ve);
             if (v) tray_now = jint(v, ve, 255);   // jint 已兼容字符串/数字两种值
@@ -693,7 +705,7 @@ void app_mqtt_start(void)
 
     // 凭据解析:NVS 优先,空则回落 secrets.h(老机器兼容)。
     device_config_t cfgc;
-    config_load(&cfgc);
+    config_load_printers(&cfgc);
     if (cfgc.bambu_uid[0]) {
         // NVS 存 "u_<id>" 或纯 id,统一成 "u_<id>"
         if (!strncmp(cfgc.bambu_uid, "u_", 2))
@@ -712,10 +724,6 @@ void app_mqtt_start(void)
         strlcpy(s_sn[i], cfgc.bambu_sn[i], sizeof(s_sn[i]));
         strlcpy(s_name[i], cfgc.bambu_name[i], sizeof(s_name[i]));
         if (s_sn[i][0]) s_mcount = i + 1;
-    }
-    if (!s_mcount) {
-        strlcpy(s_sn[0], CFG_BAMBU_SERIAL, sizeof(s_sn[0]));
-        s_mcount = 1;
     }
 
     // ===== 多机仿真测试开关(发版前必须置 0)=====

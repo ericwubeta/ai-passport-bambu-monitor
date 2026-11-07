@@ -24,11 +24,11 @@ idf.py flash monitor          # Flash the connected board and open logs
 idf.py fullclean              # Remove generated build state when configuration is stale
 ```
 
-There is no host-side automated test suite currently. Treat a clean `idf.py build` as the minimum check, then run every applicable item in the README acceptance checklist on real hardware.
+Run `python -m unittest discover -s tools -p 'test_*.py' -v` for host protocol and camera regressions. The firmware-function regressions require a native C compiler (`CC=cc` or `CC="zig cc"`); a skipped compiler-dependent suite does not count as a pass. See `tools/tests/README.md` for scope. Treat a clean `idf.py build` as the minimum firmware check, then run every applicable item in the README acceptance checklist on real hardware.
 
 ## Coding Style & Naming Conventions
 
-Write C using four-space indentation and K&R-style braces, following nearby files. Use `snake_case` for functions and locals, `BSP_*` for public hardware constants, and `s_` for file-local state. Keep BSP APIs prefixed with `bsp_`; name demo entry points `demo_<feature>_<action>`. Prefer `static` for internal symbols. UI text stays English; explanatory comments may be Chinese. Preserve comments documenting hardware-specific register values and memory constraints.
+Write C using four-space indentation and K&R-style braces, following nearby files. Use `snake_case` for functions and locals, `BSP_*` for public hardware constants, and `s_` for file-local state. Keep BSP APIs prefixed with `bsp_`; name demo entry points `demo_<feature>_<action>`. Prefer `static` for internal symbols. Hardware-demo UI text stays English. Printer-monitor pages, including the camera page, retain the existing Chinese labels for a consistent interface; camera connection/configuration prompts may stay English. This monitor-specific language choice was explicitly confirmed by the user. Explanatory comments may be Chinese. Preserve comments documenting hardware-specific register values and memory constraints.
 
 ## Testing Guidelines
 

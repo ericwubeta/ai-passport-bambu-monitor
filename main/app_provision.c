@@ -1010,7 +1010,7 @@ static esp_err_t save_handler(httpd_req_t *req)
 
 static esp_err_t camera_get_handler(httpd_req_t *req) {
     device_config_t devices;
-    config_load(&devices);
+    config_load_printers(&devices);
     int used = snprintf(s_buf, SBUF, "{\"machines\":[");
     bool first = true;
     for (int i = 0; i < CFG_MACHINE_MAX; i++) {
@@ -1052,7 +1052,7 @@ static esp_err_t camera_save_handler(httpd_req_t *req) {
         }
     }
     device_config_t devices;
-    config_load(&devices);
+    config_load_printers(&devices);
     const char *serial = devices.bambu_sn[index[0]-'0'];
     if (!serial[0]) { send_json(req, "{\"err\":\"Configure the printer account first\"}"); return ESP_OK; }
     camera_config_t camera;

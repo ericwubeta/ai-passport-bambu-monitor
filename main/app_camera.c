@@ -120,8 +120,10 @@ static bool connect_camera(camera_reader_t *r) {
     ESP_LOGI(TAG, "TLS receive_limit=%u", (unsigned)mbedtls_ssl_get_max_in_record_payload(esp_tls_get_ssl_context(r->tls)));
     if (!current(r->token)) return false;
     if (memcmp(r->candidate_pin, r->config.certificate_sha256, 32)) {
-        memcpy(r->config.certificate_sha256, r->candidate_pin, 32);
-        if (!camera_config_save(r->serial, &r->config)) return false;
+        camera_config_t pinned = r->config;
+        memcpy(pinned.certificate_sha256, r->candidate_pin, 32);
+        if (!camera_config_save(r->serial, &pinned)) return false;
+        r->config = pinned;
     }
     return true;
 }
@@ -439,6 +441,9 @@ static void worker(void *unused) {
         bool jpeg = r->config.transport == CAMERA_JPEG_STREAM;
         while (current(r->token)) {
             bool ok = false;
+            // This attempt may skip fetch entirely while WiFi is offline.
+            // Only drawing in this attempt can invalidate the last good image.
+            r->drew = false;
             r->error = CAMERA_RETRYING;
             int64_t start = esp_timer_get_time();
             if (app_wifi_connected()) {

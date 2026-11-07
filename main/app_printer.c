@@ -1089,8 +1089,9 @@ static void refresh_all(void)
     if (ams_pages > 4) ams_pages = 4;
     if (ams_pages == 0 && st.gcode_state[0]) ams_pages = 1;
     if (s_restore_slot >= 0) {
-        if (wanted_slot >= 2 && wanted_slot <= 5 && !st.gcode_state[0]) {
-            // Do not mistake an empty startup snapshot for a removed AMS.
+        if (wanted_slot >= 2 && wanted_slot <= 5 && !st.ams_topology_known) {
+            // G-code deltas can arrive before AMS topology. Keep the saved
+            // slot pending until an explicit (possibly empty) array arrives.
             if (ams_pages < wanted_slot - 1) ams_pages = wanted_slot - 1;
         } else {
             s_restore_slot = -1;

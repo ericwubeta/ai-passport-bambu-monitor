@@ -1,5 +1,6 @@
 // main/app_config.c —— NVS 配置读写实现(见 app_config.h)。
 #include "app_config.h"
+#include "app_secrets.h"
 
 #include <string.h>
 
@@ -71,6 +72,16 @@ bool config_load(device_config_t *cfg) {
         nvs_get_str(s_handle, "bambu_sn", cfg->bambu_sn[0], &n);
     }
     return true;
+}
+
+bool config_load_printers(device_config_t *cfg) {
+    if (!cfg) return false;
+    bool loaded = config_load(cfg);
+    if (config_machine_count(cfg) == 0 && CFG_BAMBU_SERIAL[0] &&
+        strcmp(CFG_BAMBU_SERIAL, "00C00AAAA000000")) {
+        strlcpy(cfg->bambu_sn[0], CFG_BAMBU_SERIAL, sizeof(cfg->bambu_sn[0]));
+    }
+    return loaded;
 }
 
 bool config_save(const device_config_t *cfg) {
