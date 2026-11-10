@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "camera_rate.h"
 
 typedef enum {
     CAMERA_OFF, CAMERA_UNCONFIGURED, CAMERA_CONNECTING, CAMERA_READY,
@@ -12,6 +13,7 @@ typedef struct {
     int source_w, source_h;
     int64_t updated_us;
     unsigned frames;
+    camera_rate_t rate;
     char model[25];
 } camera_state_t;
 

@@ -21,6 +21,7 @@
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 #define PAGE_MAX 9          // progress, camera, temperature, four AMS, device, control
 #define CAMERA_SLOT 8
@@ -122,9 +123,7 @@ static bool s_cam_had_image;
 
 static void refresh_all(void);    // 前向声明(tick_fast 要调,定义在后面)
 static void ov_refresh(void);     // 前向声明(refresh_all 概览模式要调)
-static void detail_build(void);   // 前向声明(概览→详情切换要用)
 static void detail_free(void);    // 前向声明(详情→概览切换要用)
-static void ensure_ams_pages(int n); // 前向声明(refresh_all 随 AMS 数据补建页)
 static void apply_page_vis(int show); // 前向声明(refresh_all 懒建页后收敛可见性)
 static void show_page(int idx);   // 前向声明(ov_key 进详情要调)
 static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev);
@@ -350,7 +349,7 @@ static void header_build(void)
     s_bat_charge = rect(s_scr, 216, 9, 11, 13, C_BG);
     lv_obj_set_style_bg_opa(s_bat_charge, LV_OPA_TRANSP, 0);
     lv_obj_add_event_cb(s_bat_charge, battery_charge_draw, LV_EVENT_DRAW_MAIN, NULL);
-    lv_obj_set_hidden(s_bat_charge, true);
+    lv_obj_add_flag(s_bat_charge, LV_OBJ_FLAG_HIDDEN);
 }
 
 // 常驻状态条(header 下方 18px):有 HMS 显示告警,否则显示云/WiFi 摘要。
@@ -587,14 +586,16 @@ static void refresh_camera(const bambu_state_t *st) {
     default: hint = "Connecting camera..."; break;
     }
     if (camera.has_image) {
-        int age = (esp_timer_get_time()-camera.updated_us)/1000000;
-        bool stale = age > 12 || camera.status != CAMERA_READY;
-        snprintf(text, sizeof(text), stale ? "%ds old - retrying" : "%ds ago", age);
+        bool stale = camera_rate_stale(camera.updated_us, esp_timer_get_time(), CONFIG_CAMERA_STALE_MS);
+        unsigned fps = camera_rate_tenths(&camera.rate);
+        if (stale) strlcpy(text, "Loading...", sizeof(text));
+        else if (!camera.rate.count) strlcpy(text, "-- FPS", sizeof(text));
+        else snprintf(text, sizeof(text), "%u.%u FPS", fps / 10, fps % 10);
         lv_label_set_text(s_cam_age, text);
         lv_obj_set_style_text_color(s_cam_age, lv_color_hex(stale ? C_YELLOW : C_DIM), 0);
         lv_obj_add_flag(s_cam_placeholder, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_label_set_text(s_cam_age, camera.status == CAMERA_UNCONFIGURED ? "Not configured" : "Waiting for image");
+        lv_label_set_text(s_cam_age, camera.status == CAMERA_UNCONFIGURED ? "Not configured" : "Loading...");
         lv_obj_set_style_text_color(s_cam_age, lv_color_hex(C_DIM), 0);
         lv_label_set_text(s_cam_placeholder, hint);
         lv_obj_remove_flag(s_cam_placeholder, LV_OBJ_FLAG_HIDDEN);
@@ -745,7 +746,7 @@ static void page_ams_build(lv_obj_t *p, int ams_idx)
 static void refresh_ams(const bambu_state_t *st, int ams_idx, int total_ams)
 {
     const bambu_ams_t *a = &st->ams[ams_idx];
-    char t[64];
+    char t[80];
 
     if (!a->present) {
         // 外部料筒
@@ -1065,7 +1066,8 @@ static void refresh_header(const bambu_state_t *st)
     uint32_t fc = soc > 50 ? C_GREEN : (soc > 20 ? C_YELLOW : C_RED);
     lv_obj_set_width(s_bat_fill, (soc < 0 ? 0 : soc) * 20 / 100);   // 电池内部净宽 20
     lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(fc), 0);
-    lv_obj_set_hidden(s_bat_charge, !bsp_battery_usb_connected());
+    if (bsp_battery_usb_connected()) lv_obj_remove_flag(s_bat_charge, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(s_bat_charge, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void refresh_all(void)
@@ -1097,7 +1099,6 @@ static void refresh_all(void)
             s_restore_slot = -1;
         }
     }
-    if (wanted_slot != CAMERA_SLOT) ensure_ams_pages(ams_pages);
     // 导航序 → 实体槽位:进度/温度固定,AMS 只取前 ams_pages 个,设备/控制固定 6/7
     {
         int n = 0;
@@ -1292,7 +1293,6 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         s_restore_slot = -1;
         s_ov_mode = false;
         if (s_ov_page) { lv_obj_delete(s_ov_page); s_ov_page = NULL; }
-        detail_build();
         s_cur = 0;
         s_show_eta = false;
         s_prev_valid = false;
@@ -1308,26 +1308,29 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 // 只显示 show 对应的实体页,其余全部隐藏(NULL = 未建的 AMS 页,跳过)
 static void apply_page_vis(int show)
 {
-    if (show == CAMERA_SLOT && !s_pages[CAMERA_SLOT]) {
-        // Camera widgets replace hidden detail widgets instead of increasing
-        // the LVGL pool. The original pages are rebuilt when leaving camera.
-        for (int i = 0; i < CAMERA_SLOT; i++) {
-            if (s_pages[i]) { lv_obj_delete(s_pages[i]); s_pages[i] = NULL; }
-        }
-        s_pages[CAMERA_SLOT] = page_new();
-        page_camera_build(s_pages[CAMERA_SLOT]);
+    if (show < 0 || show >= PAGE_MAX) return;
+    if (show != CAMERA_SLOT && s_pages[CAMERA_SLOT]) app_camera_stop();
+    // Retain only the visible detail page. The camera worker may still be
+    // unwinding a cancelled TLS read; rebuilding every hidden page alongside
+    // its preview would exceed the shared heap on a no-PSRAM C3.
+    for (int i = 0; i < PAGE_MAX; i++) {
+        if (i == show || !s_pages[i]) continue;
+        if (i == 7) s_stop_armed = false;
+        lv_obj_delete(s_pages[i]); s_pages[i] = NULL;
+    }
+    if (s_pages[show]) return;
+    lv_obj_t *page = s_pages[show] = page_new();
+    if (show == CAMERA_SLOT) {
+        page_camera_build(page);
         s_cam_had_image = false;
         app_camera_start(s_midx, 0, CAMERA_VIEW_Y, 240, CAMERA_VIEW_H);
-    } else if (show != CAMERA_SLOT && s_pages[CAMERA_SLOT]) {
-        app_camera_stop();
-        lv_obj_delete(s_pages[CAMERA_SLOT]); s_pages[CAMERA_SLOT] = NULL;
-        detail_build();
-    }
-    for (int i = 0; i < PAGE_MAX; i++) {
-        if (!s_pages[i]) continue;
-        if (i == show) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-        else           lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-    }
+    } else if (show == 0) page_progress_build(page);
+    else if (show == 1) page_temp_build(page);
+    else if (show >= 2 && show <= 5) page_ams_build(page, show - 2);
+    else if (show == 6) page_device_build(page);
+    else if (show == 7) page_control_build(page);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_HIDDEN);
+    s_dirty = true;
 }
 
 static void show_page(int idx)
@@ -1362,30 +1365,6 @@ static lv_obj_t *page_new(void)
     lv_obj_set_style_border_width(p, 0, 0);
     lv_obj_set_style_pad_all(p, 0, 0);
     return p;
-}
-
-// 补建前 n 个 AMS 页(已有则跳过);refresh_all 随数据到达逐页补齐
-static void ensure_ams_pages(int n)
-{
-    if (n > 4) n = 4;
-    for (int i = 0; i < n; i++) {
-        if (s_pages[2 + i]) continue;
-        s_pages[2 + i] = page_new();
-        page_ams_build(s_pages[2 + i], i);
-    }
-}
-
-static void detail_build(void)
-{
-    s_pages[0] = page_new();
-    s_pages[1] = page_new();
-    for (int i = 2; i <= 5; i++) s_pages[i] = NULL;   // AMS 页延迟到数据到达再建
-    s_pages[6] = page_new();
-    s_pages[7] = page_new();
-    page_progress_build(s_pages[0]);
-    page_temp_build(s_pages[1]);
-    page_device_build(s_pages[6]);
-    page_control_build(s_pages[7]);
 }
 
 static void detail_free(void)
@@ -1431,7 +1410,6 @@ void app_printer_enter(void)
     } else {
         s_ov_mode = false;
         if (saved_machine >= 0) s_restore_slot = saved.slot;
-        detail_build();
     }
 
     s_cur = 0;
@@ -1459,13 +1437,19 @@ void app_printer_enter(void)
     }
 
     lv_screen_load(s_scr);
-    // 诊断:LVGL 内置内存池(默认 48KB)使用情况,排查对象创建超池导致卡死
+    // The CLIB allocator shares ESP-IDF's heap; LVGL's pool monitor is empty.
+#ifdef CONFIG_LV_USE_CLIB_MALLOC
+    ESP_LOGI("printer", "UI shared heap: free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+#else
     {
         lv_mem_monitor_t mon;
         lv_mem_monitor(&mon);
         ESP_LOGI("printer", "LVGL池: 总=%d 空=%d 已用=%d%%", (int)mon.total_size,
                  (int)mon.free_size, (int)mon.used_pct);
     }
+#endif
     refresh_all();
 }
 

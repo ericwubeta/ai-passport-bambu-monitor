@@ -90,7 +90,7 @@
               <img class="camera-photo" alt="X2D 实测采集的打印机内部快照，非实时连接" hidden>
               <div class="camera-interruption" hidden><span>画面连接中断</span><small>最后画面 · 18s 前</small></div>
             </div>
-            <div class="camera-age"><span class="camera-age-dot"></span><span class="camera-age-text">2s 前更新</span></div>
+            <div class="camera-age" data-tooltip="原型示例；固件按成功显示间隔测量 FPS，五秒未更新显示 Loading..."><span class="camera-age-dot"></span><span class="camera-age-text">1.0 FPS</span></div>
             <div class="camera-model">X2D</div>
             <div class="camera-print-state">打印中</div><div class="camera-percent">68%</div><div class="camera-remaining">剩余 1h24m</div>
             <div class="camera-track" role="progressbar" aria-label="打印进度" aria-valuenow="68" aria-valuemin="0" aria-valuemax="100"><div class="camera-fill"></div></div>
@@ -136,7 +136,6 @@
   const options = { showLayer:true, showTemperature:true };
   let scenario = 'printing';
   let page = 1;
-  let age = 2;
   let showEta = false;
   const saved = window.openai?.widgetState;
   const model = saved?.modelContent || saved || {};
@@ -194,7 +193,7 @@
     q('.camera-bed .value').textContent = idle ? '27°' : '60°';
     root.querySelectorAll('.camera-temperature').forEach(el => el.hidden = !options.showTemperature);
     q('.camera-interruption').hidden = !stale;
-    q('.camera-age-text').textContent = stale ? '18s 未更新' : `${age}s 前更新`;
+    q('.camera-age-text').textContent = stale ? 'Loading...' : '1.0 FPS';
     q('.camera-age-text').style.color = stale ? 'var(--passport-yellow)' : 'var(--passport-dim)';
     q('.camera-age-dot').style.background = stale ? 'var(--passport-yellow)' : 'var(--passport-green)';
     q('.progress-state').textContent = status;
@@ -213,14 +212,14 @@
   }
   function resize() { screen.style.setProperty('--passport-scale',String(device.getBoundingClientRect().width/240)); }
   root.querySelectorAll('[data-scenario]').forEach(button => button.addEventListener('click',() => {
-    scenario = button.dataset.scenario; age = 2; render(); save();
+    scenario = button.dataset.scenario; render(); save();
   }));
   root.querySelectorAll('[data-key]').forEach(button => button.addEventListener('click',() => {
     const key = button.dataset.key;
     if (key === 'up') page=0;
     if (key === 'down') page=1;
     if (key === 'ok') {
-      if (page===1) { scenario = scenario === 'stale' ? 'printing' : scenario; age=0; }
+      if (page===1) { scenario = scenario === 'stale' ? 'printing' : scenario; }
       else showEta=!showEta;
     }
     render(); save();

@@ -43,3 +43,19 @@ The firmware regression cases cover:
 The six tests in `test_probe_camera_snapshot.py` exercise the host-side protocol
 probe separately. These checks do not replace an ESP-IDF build or real-device
 validation of TLS, power management and display behavior.
+
+Transport regressions compile actual snapshot fetch/read/write/close functions:
+authenticated session reuse, failure reconnect, stream protocol compatibility and
+identity rejection during reused TLS I/O. Rendering regressions compile the real
+JPEG output, decode and presentation functions with stub JPEG/LCD I/O. They check
+zero LCD writes before validation, RGB565 colors and dynamic letterboxes for
+landscape/portrait/small sources, odd-width/cross-block output guards, memory and
+decode/input/checksum failure, cancellation, display-lock failure and partial LCD
+failure. The real FPS helper is checked against successful presentation intervals,
+delayed updates, clock reset and the exact five-second Loading boundary.
+Navigation tests compile actual page switching with an allocator budget that
+allows one visible detail page while the cancelled camera still owns its buffer.
+They cycle all pages and four AMS slots, verify stop-before-delete, retain widgets
+on repeated refresh and cancel control confirmation on leaving its page. MQTT
+client-ID cases distinguish two device MACs with the same nonce, another boot,
+and the fallback when MAC reading fails.

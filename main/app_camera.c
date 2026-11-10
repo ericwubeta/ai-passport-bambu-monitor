@@ -1,11 +1,12 @@
-// Camera transport runs outside LVGL. Only bounded RGB stripes reach the BSP;
-// no complete compressed or decoded frame is allocated on this no-PSRAM board.
+// Transport/decode run outside LVGL. Buffered targets retain only the fitted
+// RGB565 preview; neither a complete JPEG nor source-resolution RGB is stored.
 #include "app_camera.h"
 #include "app_camera_config.h"
 #include "app_mqtt.h"
 #include "app_wifi.h"
 #include "bsp_display.h"
 #include "camera_geometry.h"
+#include "camera_frame.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,20 @@
 
 #define IMAGE_LIMIT (2 * 1024 * 1024)
 #define JSON_LIMIT 1024
+#ifndef CAMERA_SUCCESS_DELAY_MS
+#ifdef CONFIG_CAMERA_REFRESH_DELAY_MS
+#define CAMERA_SUCCESS_DELAY_MS CONFIG_CAMERA_REFRESH_DELAY_MS
+#else
+#define CAMERA_SUCCESS_DELAY_MS 2000
+#endif
+#endif
+#ifndef CAMERA_REUSE_SESSION
+#ifdef CONFIG_CAMERA_REUSE_SESSION
+#define CAMERA_REUSE_SESSION 1
+#else
+#define CAMERA_REUSE_SESSION 0
+#endif
+#endif
 static const char *TAG = "camera";
 static portMUX_TYPE s_guard = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_task;
@@ -38,7 +53,7 @@ typedef struct {
     camera_config_t config;
     camera_geometry_t geometry;
     int x, y, vw, vh, left, result, total, received, band_rows;
-    bool failed, drew, identity_failed, certificate_seen, jpeg_stream, tiled;
+    bool failed, drew, identity_failed, certificate_seen, jpeg_stream, tiled, buffered;
     camera_status_t error;
     uint8_t candidate_pin[32], tail[2];
     char md5_expected[33], json[JSON_LIMIT];
@@ -46,6 +61,10 @@ typedef struct {
     mbedtls_md5_context md5;
     uint8_t *work;
     uint16_t *stripe;
+    camera_frame_t frame;
+    int64_t io_us, draw_us;
+    unsigned reads, draws;
+    char image_md5[33], previous_md5[33];
 } camera_reader_t;
 static camera_reader_t *s_verifying;
 
@@ -63,6 +82,7 @@ static void status(camera_reader_t *r, camera_status_t value, bool success) {
         if (success) {
             s_state.has_image = true;
             s_state.updated_us = esp_timer_get_time();
+            camera_rate_record(&s_state.rate, s_state.updated_us);
             s_state.source_w = r->geometry.source_w;
             s_state.source_h = r->geometry.source_h;
             s_state.frames++;
@@ -128,11 +148,20 @@ static bool connect_camera(camera_reader_t *r) {
     return true;
 }
 
-static bool read_bytes(camera_reader_t *r, void *destination, int length) {
+static void close_camera(camera_reader_t *r) {
+    if (r->tls) esp_tls_conn_destroy(r->tls);
+    r->tls = NULL;
+    if (s_verifying == r) s_verifying = NULL;
+}
+
+static bool read_bytes_inner(camera_reader_t *r, void *destination, int length) {
     uint8_t *p = destination;
     int64_t deadline = esp_timer_get_time() + 7000000;
     while (length > 0 && current(r->token) && esp_timer_get_time() < deadline) {
         int n = esp_tls_conn_read(r->tls, p, length);
+        // A reused TLS session can renegotiate. Never pass data from a failed
+        // identity callback to the JPEG decoder, even in OPTIONAL TLS mode.
+        if (r->identity_failed) { r->error = CAMERA_IDENTITY_ERROR; return false; }
         if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE || n == MBEDTLS_ERR_SSL_TIMEOUT) {
             vTaskDelay(1); continue;
         }
@@ -145,11 +174,20 @@ static bool read_bytes(camera_reader_t *r, void *destination, int length) {
     return length == 0;
 }
 
+static bool read_bytes(camera_reader_t *r, void *destination, int length) {
+    int64_t start = esp_timer_get_time();
+    bool ok = read_bytes_inner(r, destination, length);
+    r->io_us += esp_timer_get_time() - start;
+    r->reads++;
+    return ok;
+}
+
 static bool write_bytes(camera_reader_t *r, const void *source, int length) {
     const uint8_t *p = source;
     int64_t deadline = esp_timer_get_time() + 7000000;
     while (length > 0 && current(r->token) && esp_timer_get_time() < deadline) {
         int n = esp_tls_conn_write(r->tls, p, length);
+        if (r->identity_failed) { r->error = CAMERA_IDENTITY_ERROR; return false; }
         if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) { vTaskDelay(1); continue; }
         if (n <= 0) return false;
         p += n; length -= n;
@@ -197,7 +235,7 @@ static int number(cJSON *obj, const char *key, int fallback) {
     return cJSON_IsNumber(value) ? value->valueint : fallback;
 }
 
-static bool begin_snapshot(camera_reader_t *r) {
+static bool start_snapshot_session(camera_reader_t *r) {
     r->sequence = 1;
     uint8_t auth[16] = {'b','b','l','p',0,0,0,0};
     memcpy(auth + 8, r->config.access_code, 8);
@@ -213,7 +251,10 @@ static bool begin_snapshot(camera_reader_t *r) {
     cJSON *obj = read_json(r, &left);
     bool ready = obj && !left && number(obj, "result", -1) == 0 && number(obj, "mtype", -1) == 12291;
     cJSON_Delete(obj);
-    if (!ready) return false;
+    return ready;
+}
+
+static bool request_snapshot(camera_reader_t *r) {
     r->request = r->sequence;
     char param[160], request[384];
     int pn = snprintf(param, sizeof(param), "{\"command\":\"get_project_file\",\"file_rel_path\":\"\",\"peer_host\":\"studio\",\"sequence_id\":%u,\"version\":1}", (unsigned)r->request);
@@ -297,6 +338,34 @@ static UINT jpeg_input(JDEC *decoder, BYTE *destination, UINT requested) {
     return got;
 }
 
+static bool draw_stripe(camera_reader_t *r, int x, int y, int width, int height) {
+    int64_t start = esp_timer_get_time();
+    bool ok = bsp_lvgl_stream_draw(r->token, x, y, width, height, r->stripe);
+    r->draw_us += esp_timer_get_time() - start;
+    r->draws++;
+    return ok;
+}
+
+static void *allocate_preview(size_t bytes) {
+    // ESP32 prefers unused instruction RAM for aligned 32-bit-only allocations.
+    return heap_caps_malloc(bytes, MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL);
+}
+
+static bool present_frame(camera_reader_t *r) {
+    if (!bsp_lvgl_lock(150)) return false;
+    bool ok = current(r->token) && bsp_lvgl_stream_set(r->y, r->vh, r->token);
+    // Hold the recursive display lock only for this short commit, never during
+    // network I/O or JPEG decoding. LVGL cannot interleave unrelated flushes.
+    for (int y = 0; ok && y < r->vh; y += CAMERA_FRAME_ROWS) {
+        int rows = r->vh - y < CAMERA_FRAME_ROWS ? r->vh - y : CAMERA_FRAME_ROWS;
+        camera_frame_copy_rows(&r->frame, y, rows, (uint32_t *)r->stripe);
+        r->drew = true;
+        ok = current(r->token) && draw_stripe(r, r->x, r->y + y, r->vw, rows);
+    }
+    bsp_lvgl_unlock();
+    return ok;
+}
+
 static UINT jpeg_output(JDEC *decoder, void *bitmap, JRECT *rect) {
     camera_reader_t *r = decoder->device;
     const camera_geometry_t *g = &r->geometry;
@@ -306,22 +375,26 @@ static UINT jpeg_output(JDEC *decoder, void *bitmap, JRECT *rect) {
     int y1 = camera_geometry_edge(rect->bottom + 1, g->height, g->decoded_h);
     int x0 = camera_geometry_edge(rect->left, g->width, g->decoded_w);
     int x1 = camera_geometry_edge(rect->right + 1, g->width, g->decoded_w);
-    if (y1 - y0 > r->band_rows || !current(r->token)) return 0;
+    if ((!r->buffered && y1 - y0 > r->band_rows) || !current(r->token)) return 0;
     for (int dy = y0; dy < y1; dy++) {
         int sy = dy * g->decoded_h / g->height - rect->top;
         for (int dx = x0; dx < x1; dx++) {
             int sx = dx * g->decoded_w / g->width - rect->left;
             const uint8_t *p = rgb + (sy * rw + sx) * 3;
             uint16_t pixel = ((p[0] & 0xf8) << 8) | ((p[1] & 0xfc) << 3) | (p[2] >> 3);
-            int offset = r->tiled ? (dy-y0)*(x1-x0) + dx-x0 : (dy-y0)*g->width+dx;
-            r->stripe[offset] = __builtin_bswap16(pixel);
+            if (r->buffered) {
+                camera_frame_pixel(&r->frame, g->x + dx, g->y + dy, __builtin_bswap16(pixel));
+            } else {
+                int offset = r->tiled ? (dy-y0)*(x1-x0) + dx-x0 : (dy-y0)*g->width+dx;
+                r->stripe[offset] = __builtin_bswap16(pixel);
+            }
         }
     }
+    if (r->buffered) return 1;
     if (r->tiled && x1 > x0 && y1 > y0) {
-        if (!bsp_lvgl_stream_draw(r->token, r->x+g->x+x0, r->y+g->y+y0, x1-x0, y1-y0, r->stripe)) return 0;
+        if (!draw_stripe(r, r->x+g->x+x0, r->y+g->y+y0, x1-x0, y1-y0)) return 0;
     } else if (!r->tiled && rect->right >= g->decoded_w - 1 && y1 > y0) {
-        if (!bsp_lvgl_stream_draw(r->token, r->x + g->x, r->y + g->y + y0,
-                                   g->width, y1-y0, r->stripe)) return 0;
+        if (!draw_stripe(r, r->x + g->x, r->y + g->y + y0, g->width, y1-y0)) return 0;
     }
     return 1;
 }
@@ -330,6 +403,10 @@ static bool decode(camera_reader_t *r) {
     camera_geometry_t previous_geometry = r->geometry;
     camera_state_t previous_state;
     app_camera_snapshot(&previous_state);
+    r->buffered = false;
+#ifdef CONFIG_CAMERA_BUFFERED_PREVIEW
+    r->buffered = true;
+#endif
     JDEC decoder = {0};
     mbedtls_md5_init(&r->md5); mbedtls_md5_starts(&r->md5);
     JRESULT prepared = jd_prepare(&decoder, jpeg_input, r->work, 4096, r);
@@ -340,12 +417,32 @@ static bool decode(camera_reader_t *r) {
         r->error = prepared == JDR_MEM1 || prepared == JDR_MEM2 ? CAMERA_MEMORY_ERROR :
                    r->failed || prepared == JDR_INP ? CAMERA_RETRYING : CAMERA_UNSUPPORTED;
     if (ok) {
+        ok = current(r->token);
+    }
+    if (ok) {
         int mcu_rows = (decoder.msy * 8) >> r->geometry.scale;
         if (mcu_rows < 1) mcu_rows = 1;
         r->band_rows = (mcu_rows * r->geometry.height + r->geometry.decoded_h - 1) / r->geometry.decoded_h;
         r->tiled = false;
-        r->stripe = heap_caps_calloc(r->vw * r->band_rows, sizeof(uint16_t), MALLOC_CAP_DMA);
-        if (!r->stripe) {
+        if (r->buffered) {
+            bool allocating = r->frame.width != r->vw || r->frame.height != r->vh;
+            size_t before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+            ok = camera_frame_alloc(&r->frame, r->vw, r->vh, allocate_preview);
+            if (allocating && ok) ESP_LOGI(TAG, "preview bytes=%u dram_used=%u heap32=%u",
+                (unsigned)(r->frame.stride_words * 4 * r->vh),
+                (unsigned)(before - heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_32BIT));
+            if (ok) {
+                camera_frame_clear(&r->frame);
+                r->stripe = heap_caps_calloc(r->vw * CAMERA_FRAME_ROWS, sizeof(uint16_t), MALLOC_CAP_DMA);
+                // Keep byte-accessible RAM available for MQTT/TLS reconnects.
+                // TLS has active record buffers at this point; reserve another
+                // 16 KiB of byte-accessible RAM for concurrent network work.
+                ok = r->stripe && heap_caps_get_free_size(MALLOC_CAP_8BIT) >= 16384;
+            }
+            if (!ok) { camera_frame_free(&r->frame); r->error = CAMERA_MEMORY_ERROR; }
+        } else r->stripe = heap_caps_calloc(r->vw * r->band_rows, sizeof(uint16_t), MALLOC_CAP_DMA);
+        if (!r->buffered && !r->stripe) {
             // A small source image can need a taller MCU band. Under pressure,
             // display each resampled MCU instead of retaining a full-width band.
             // No upscaling means at most 16x16 output pixels per MCU.
@@ -354,11 +451,13 @@ static bool decode(camera_reader_t *r) {
         }
         if (!r->stripe) { r->error = CAMERA_MEMORY_ERROR; ok = false; }
     }
-    if (ok && bsp_lvgl_lock(150)) {
-        ok = current(r->token) && bsp_lvgl_stream_set(r->y, r->vh, r->token);
-        bsp_lvgl_unlock();
-    } else ok = false;
-    if (ok) {
+    if (ok && !r->buffered) {
+        if (bsp_lvgl_lock(150)) {
+            ok = current(r->token) && bsp_lvgl_stream_set(r->y, r->vh, r->token);
+            bsp_lvgl_unlock();
+        } else ok = false;
+    }
+    if (ok && !r->buffered) {
         r->drew = true;
         // Retain the previous frame while the next arrives. Clear only when
         // letterboxes change or no verified frame exists, avoiding black flashes.
@@ -367,14 +466,14 @@ static bool decode(camera_reader_t *r) {
             int clear_rows = r->tiled ? 1 : r->band_rows;
             for (int y = 0; y < r->vh && ok; y += clear_rows) {
                 int h = r->vh-y < clear_rows ? r->vh-y : clear_rows;
-                ok = bsp_lvgl_stream_draw(r->token, r->x, r->y+y, r->vw, h, r->stripe);
+                ok = draw_stripe(r, r->x, r->y+y, r->vw, h);
             }
         }
-        if (ok) {
-            JRESULT result = jd_decomp(&decoder, jpeg_output, r->geometry.scale);
-            ESP_LOGI(TAG, "decode result=%d input_failed=%d", result, r->failed);
-            ok = result == JDR_OK;
-        }
+    }
+    if (ok) {
+        JRESULT result = jd_decomp(&decoder, jpeg_output, r->geometry.scale);
+        ESP_LOGI(TAG, "decode result=%d input_failed=%d", result, r->failed);
+        ok = result == JDR_OK;
     }
     if (ok) {
         uint8_t tail[512];
@@ -387,33 +486,66 @@ static bool decode(camera_reader_t *r) {
         ok = !r->failed && current(r->token) && r->received == r->total && r->result == 0;
         ok &= r->jpeg_stream ? r->tail[0] == 0xff && r->tail[1] == 0xd9 :
                               r->md5_expected[0] && !strcmp(hex, r->md5_expected);
+        if (ok) memcpy(r->image_md5, hex, sizeof(hex));
     }
     mbedtls_md5_free(&r->md5);
+    if (ok && r->buffered) {
+        int64_t start = esp_timer_get_time();
+        ok = present_frame(r);
+        r->draw_us = esp_timer_get_time() - start;
+    }
     free(r->stripe); r->stripe = NULL;
     if (!ok && r->drew && bsp_lvgl_lock(150)) { bsp_lvgl_stream_end(r->token); bsp_lvgl_unlock(); }
     return ok;
 }
 
 static bool fetch(camera_reader_t *r, bool jpeg_stream) {
+    if (jpeg_stream) close_camera(r); // Unverified stream models retain their existing reconnect path.
     r->jpeg_stream = jpeg_stream;
     r->left = r->total = r->received = 0; r->result = 1;
-    r->failed = r->drew = r->identity_failed = r->certificate_seen = false; r->md5_expected[0] = 0;
+    r->failed = r->drew = false; r->md5_expected[0] = r->image_md5[0] = 0;
+    r->io_us = r->draw_us = 0; r->reads = r->draws = 0;
     r->error = CAMERA_RETRYING;
-    bool ok = connect_camera(r);
-    if (ok) ok = jpeg_stream ? begin_jpeg_stream(r) : begin_snapshot(r);
+    int64_t start = esp_timer_get_time();
+    bool reused = r->tls != NULL;
+    bool ok = reused;
+    if (!reused) {
+        r->identity_failed = r->certificate_seen = false;
+        ok = connect_camera(r);
+    }
+    int64_t connected = esp_timer_get_time();
+    if (ok && !reused && !jpeg_stream) ok = start_snapshot_session(r);
+    if (ok) ok = jpeg_stream ? begin_jpeg_stream(r) : request_snapshot(r);
+    int64_t ready = esp_timer_get_time(), prior_io = r->io_us;
     if (ok) ok = decode(r);
-    if (r->tls) esp_tls_conn_destroy(r->tls);
-    r->tls = NULL; s_verifying = NULL;
+    int64_t done = esp_timer_get_time();
+    bool changed = ok && r->image_md5[0] && strcmp(r->image_md5, r->previous_md5);
+    if (ok) memcpy(r->previous_md5, r->image_md5, sizeof(r->previous_md5));
+    ESP_LOGI(TAG, "perf reuse=%d tls_ms=%lld setup_ms=%lld body_io_ms=%lld cpu_ms=%lld draw_ms=%lld bytes=%d reads=%u draws=%u changed=%d",
+        reused, (connected-start)/1000, (ready-connected)/1000, (r->io_us-prior_io)/1000,
+        (done-ready-(r->io_us-prior_io)-r->draw_us)/1000, r->draw_us/1000, r->received, r->reads, r->draws, changed);
+    if (!ok || jpeg_stream || !CAMERA_REUSE_SESSION) close_camera(r);
+    if (!ok) camera_frame_free(&r->frame);
     return ok;
 }
 
 static void worker(void *unused) {
+    // ESP32 can schedule this task on the other core before xTaskCreate returns.
+    // Wait until the owner has published its handle, including the OOM path.
+    for (;;) {
+        portENTER_CRITICAL(&s_guard); bool starting = s_starting; portEXIT_CRITICAL(&s_guard);
+        if (!starting) break;
+        vTaskDelay(1);
+    }
     camera_reader_t *r = calloc(1, sizeof(*r));
     if (r) r->work = malloc(4096);
     if (!r || !r->work) {
         portENTER_CRITICAL(&s_guard); s_state.status = CAMERA_MEMORY_ERROR; portEXIT_CRITICAL(&s_guard);
     }
     while (r && r->work) {
+        // A page generation or selected printer change always owns a new TLS session.
+        close_camera(r);
+        camera_frame_free(&r->frame);
         portENTER_CRITICAL(&s_guard);
         bool requested = s_requested;
         r->token = s_generation; int machine = s_machine;
@@ -453,13 +585,17 @@ static void worker(void *unused) {
                     ok = fetch(r, true);
                     if (ok) jpeg = true;
                 }
+            } else {
+                close_camera(r);
+                camera_frame_free(&r->frame);
             }
             status(r, ok ? CAMERA_READY : r->error, ok);
-            ESP_LOGI(TAG, "frame ok=%d status=%d source=%dx%d fitted=%dx%d ms=%lld heap=%u largest=%u",
+            ESP_LOGI(TAG, "frame ok=%d status=%d source=%dx%d fitted=%dx%d ms=%lld heap=%u largest=%u stack=%u",
                 ok, ok ? CAMERA_READY : r->error, r->geometry.source_w, r->geometry.source_h,
                 r->geometry.width, r->geometry.height, (esp_timer_get_time()-start)/1000,
-                (unsigned)esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-            unsigned delay_ms = ok ? 2000 : 5000;
+                (unsigned)esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            unsigned delay_ms = ok ? CAMERA_SUCCESS_DELAY_MS : 5000;
             for (unsigned waited=0; waited<delay_ms && current(r->token); waited+=100) {
                 portENTER_CRITICAL(&s_guard); bool refresh = s_refresh; s_refresh = false; portEXIT_CRITICAL(&s_guard);
                 if (refresh) break;
@@ -467,7 +603,7 @@ static void worker(void *unused) {
             }
         }
     }
-    if (r) { free(r->work); free(r); }
+    if (r) { close_camera(r); camera_frame_free(&r->frame); free(r->work); free(r); }
     portENTER_CRITICAL(&s_guard);
     if (s_task == xTaskGetCurrentTaskHandle()) { s_task = NULL; s_starting = false; }
     portEXIT_CRITICAL(&s_guard);

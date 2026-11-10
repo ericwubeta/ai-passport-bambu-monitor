@@ -1,4 +1,31 @@
 menu "Printer camera"
+    config CAMERA_BUFFERED_PREVIEW
+        bool "Buffer fitted RGB565 preview before presenting"
+        depends on LV_USE_CLIB_MALLOC && !ESP_WIFI_IRAM_OPT && !ESP_WIFI_RX_IRAM_OPT
+        default y
+        help
+            Decode and verify before updating the LCD in one short locked burst.
+            Uses bounded RGB565 blocks for the fitted display area. No full JPEG
+            or source-resolution RGB buffer. The Passport defaults move selected
+            code to Flash to leave RAM for the preview alongside MQTT and TLS.
+    config CAMERA_STALE_MS
+        int "Show Loading after no verified display update (ms)"
+        range 1000 60000
+        default 5000
+    config CAMERA_REFRESH_DELAY_MS
+        int "Delay after a verified camera snapshot (ms)"
+        range 0 10000
+        default 100
+        help
+            This is added after transfer/decode/display time, not a frame period.
+            Failures keep their separate backoff. Manual refresh skips this delay.
+    config CAMERA_REUSE_SESSION
+        bool "Reuse authenticated TLS session for JPEG snapshots"
+        default y
+        help
+            Avoid a handshake per frame. Applies to the JPEG file-preview path;
+            stream protocol models keep their existing reconnect behavior.
+            Releases the connection on failure, page exit or printer change.
     config CAMERA_START_ON_SECOND_PAGE
         bool "Open camera page at startup (single printer, diagnostic builds)"
         default n

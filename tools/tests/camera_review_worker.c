@@ -3,6 +3,7 @@
 #include "app_camera_config.h"
 #include "camera_geometry.h"
 #define JSON_LIMIT 1024
+#define CAMERA_SUCCESS_DELAY_MS 2000
 typedef void *TaskHandle_t;
 typedef void esp_tls_t;
 typedef struct { int unused; } mbedtls_md5_context;
@@ -14,6 +15,10 @@ static camera_state_t s_state;
 static int attempts, fetches;
 static const char *scenario;
 /* @READER@ */
+static camera_reader_t *s_verifying;
+static unsigned closed;
+static int esp_tls_conn_destroy(esp_tls_t *tls) { closed++; return 0; }
+/* @CLOSE@ */
 /* @CURRENT@ */
 /* @STATUS@ */
 static bool app_wifi_connected(void) {
@@ -31,6 +36,7 @@ bool camera_config_load(const char *serial, camera_config_t *out) {
 }
 static bool fetch(camera_reader_t *reader, bool jpeg) {
     fetches++;
+    reader->tls = (void *)1;
     reader->geometry = (camera_geometry_t){.source_w=1920,.source_h=1080,.width=240,.height=135};
     reader->drew = fetches == 1 || !strcmp(scenario, "partial");
     return fetches == 1;
@@ -52,5 +58,6 @@ int main(int argc, char **argv) {
         assert(fetches == (!strcmp(scenario,"offline") ? 1 : 2));
     }
     assert(s_state.status == CAMERA_RETRYING);
+    assert(closed == (fetches ? 1u : 0u));
     return 0;
 }

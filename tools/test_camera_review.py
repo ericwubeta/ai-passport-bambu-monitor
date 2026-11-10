@@ -58,16 +58,33 @@ class CameraReviewTests(unittest.TestCase):
                       "WAKE": function(main, "screen_wake"), "TICK": function(main, "screen_off_tick"),
                       "KEY": function(main, "screen_off_on_key")},
             "worker": {"READER": reader, "CURRENT": function(sources["camera"], "current"),
+                       "CLOSE": function(sources["camera"], "close_camera"),
                        "STATUS": function(sources["camera"], "status"), "WORKER": function(sources["camera"], "worker")},
+            "transport": {"READER": reader, "CLOSE": function(sources["camera"], "close_camera"),
+                          "READ": function(sources["camera"], "read_bytes_inner"),
+                          "WRITE": function(sources["camera"], "write_bytes"),
+                          "FETCH": function(sources["camera"], "fetch")},
+            "transport_reconnect": {"READER": reader, "CLOSE": function(sources["camera"], "close_camera"),
+                          "READ": function(sources["camera"], "read_bytes_inner"),
+                          "WRITE": function(sources["camera"], "write_bytes"),
+                          "FETCH": function(sources["camera"], "fetch")},
+            "render": {"READER": reader, "DRAW": function(sources["camera"], "draw_stripe"),
+                       "ALLOCATE": function(sources["camera"], "allocate_preview"),
+                       "PRESENT": function(sources["camera"], "present_frame"),
+                       "OUTPUT": function(sources["camera"], "jpeg_output"),
+                       "DECODE": function(sources["camera"], "decode")},
+            "pages": {"PAGES": function(sources["printer"], "apply_page_vis")},
             "pin": {"READER": reader, "CURRENT": function(sources["camera"], "current"),
                     "CONNECT": function(sources["camera"], "connect_camera")},
-            "topology": {"MQTT": mqtt, "REFRESH": function(sources["printer"], "refresh_all")},
+            "topology": {"MQTT": mqtt, "CLIENT_ID": function(sources["mqtt"], "make_client_id"),
+                         "REFRESH": function(sources["printer"], "refresh_all")},
             "settings": {"ROSTER": roster, "HELPERS": "\n".join(function(sources["provision"], name)
                 for name in ["hexval", "url_decode", "form_field", "json_str", "utf8_copy"]),
                 "GET": function(sources["provision"], "camera_get_handler"),
                 "POST": function(sources["provision"], "camera_save_handler")},
         }.items():
-            text = (FIXTURES / f"camera_review_{kind}.c").read_text(encoding="utf-8")
+            fixture = "transport" if kind.startswith("transport") else kind
+            text = (FIXTURES / f"camera_review_{fixture}.c").read_text(encoding="utf-8")
             for key, value in replacements.items():
                 marker = f"/* @{key}@ */"
                 if marker not in text:
@@ -76,10 +93,13 @@ class CameraReviewTests(unittest.TestCase):
             source = cls.work / f"{kind}.c"
             source.write_text(text, encoding="utf-8")
             output = cls.work / (kind + (".exe" if os.name == "nt" else ""))
-            result = subprocess.run(cls.cc + ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror",
+            flags = ["-DCAMERA_REUSE_SESSION=" + ("0" if kind == "transport_reconnect" else "1")] if kind.startswith("transport") else []
+            result = subprocess.run(cls.cc + flags + ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror",
                 "-Wno-unused-function", "-Wno-unused-variable", "-Wno-unused-parameter", "-Wno-sign-compare",
                 "-I", str(ROOT / "main"), "-I", str(FIXTURES), str(source),
                 str(ROOT / "main/app_notify_transition.c"), str(ROOT / "main/app_screen_policy.c"),
+                str(ROOT / "main/camera_frame.c"), str(ROOT / "main/camera_rate.c"),
+                str(ROOT / "main/camera_geometry.c"),
                 "-o", str(output)], capture_output=True, encoding="utf-8", errors="replace")
             if result.returncode:
                 raise AssertionError(result.stdout + result.stderr)
@@ -91,6 +111,42 @@ class CameraReviewTests(unittest.TestCase):
 
     def test_offline_poll_retains_verified_image(self):
         self.run_case("worker", "offline")
+
+    def test_camera_snapshot_session_is_reused_after_verified_frame(self):
+        self.run_case("transport", "reuse")
+
+    def test_camera_session_reconnects_after_request_or_decode_failure(self):
+        self.run_case("transport", "failure")
+
+    def test_camera_session_setup_failure_is_not_reused(self):
+        self.run_case("transport", "setup-failure")
+
+    def test_camera_reused_session_rejects_changed_identity_during_io(self):
+        self.run_case("transport", "identity-io")
+
+    def test_camera_reconnect_mode_and_unverified_stream_models_still_close(self):
+        self.run_case("transport_reconnect", "reconnect")
+        self.run_case("transport", "stream")
+
+    def test_verified_preview_commits_complete_rgb565_and_dynamic_letterboxes(self):
+        for case in ["landscape", "portrait", "small"]:
+            self.run_case("render", case)
+
+    def test_preview_errors_and_page_cancellation_retain_previous_image(self):
+        for case in ["checksum", "cancel", "cancel-header", "input-failure", "decode-failure", "busy", "allocation", "low-memory"]:
+            self.run_case("render", case)
+
+    def test_partial_lcd_failure_ends_stream(self):
+        self.run_case("render", "draw-failure")
+
+    def test_measured_fps_window_and_loading_deadline(self):
+        self.run_case("render", "rate")
+
+    def test_navigation_bounds_page_memory_during_asynchronous_camera_stop(self):
+        self.run_case("pages", "cycle")
+
+    def test_mqtt_client_ids_distinguish_boards_and_boots(self):
+        self.run_case("topology", "client-id")
 
     def test_inactive_print_states_sleep_with_or_without_usb(self):
         self.run_case("power", "inactive")

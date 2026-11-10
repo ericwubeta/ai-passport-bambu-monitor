@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "camera_frame.h"
 
 // Host libc compatibility; firmware uses the ESP-IDF implementation.
 static size_t host_strlcpy(char *dst, const char *src, size_t size) {

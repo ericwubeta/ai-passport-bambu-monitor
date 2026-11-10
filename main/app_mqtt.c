@@ -16,6 +16,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -53,6 +54,21 @@ static char s_name[BAMBU_MACHINE_MAX][17]; // 自定义名称(可空)
 static int  s_mcount;             // 有效机器数 1..4
 
 static const char *sn_at(int i) { return s_sn[i]; }
+
+static void make_client_id(char *out, size_t size)
+{
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        // Boot time is similar on different boards. A duplicate MQTT client ID
+        // makes the broker evict the other connection, even with healthy TLS.
+        snprintf(out, size, "bbl_%02x%02x%02x%02x%02x%02x%06x",
+                 (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
+                 (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5],
+                 (unsigned)(esp_random() & 0xffffff));
+    } else {
+        snprintf(out, size, "bbl_%08x%08x", (unsigned)esp_random(), (unsigned)esp_random());
+    }
+}
 
 // topic → 机器下标:device/<SN>/report 形态,匹配配置的 SN 列表
 static int idx_from_topic(const char *topic, int tlen)
@@ -668,7 +684,7 @@ static void on_mqtt(void *handler_arg, esp_event_base_t base, int32_t id, void *
         // 每台机器各订阅 report topic,否则收不到推送
         for (int i = 0; i < s_mcount; i++) {
             char rt[48];
-            snprintf(rt, sizeof(rt), "device/%s/report", sn_at(i));
+            snprintf(rt, sizeof(rt), "device/%.*s/report", (int)sizeof(s_sn[0]) - 1, sn_at(i));
             esp_mqtt_client_subscribe(s_cli, rt, 0);
             ESP_LOGI(TAG, "已订阅 %s", rt);
             push_pushall(i);
@@ -756,8 +772,8 @@ void app_mqtt_start(void)
         return;
     }
 
-    char cid[20];
-    snprintf(cid, sizeof(cid), "bbl_%06X", (unsigned)(esp_timer_get_time() >> 10) & 0xFFFFFF);
+    char cid[24];
+    make_client_id(cid, sizeof(cid));
 
     esp_mqtt_client_config_t cfg = { 0 };
     cfg.broker.address.hostname = BROKER_HOST;

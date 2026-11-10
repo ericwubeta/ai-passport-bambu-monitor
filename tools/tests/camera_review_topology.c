@@ -2,6 +2,15 @@
 #include "app_mqtt.h"
 #include "app_notify.h"
 #include "app_screen_policy.h"
+enum { ESP_OK = 0, ESP_MAC_WIFI_STA = 0 };
+static uint8_t test_mac[6] = {1,2,3,4,5,6};
+static bool test_mac_valid = true;
+static uint32_t test_nonce;
+static int esp_read_mac(uint8_t *out, int kind) {
+    memcpy(out, test_mac, 6); return test_mac_valid ? 0 : -1;
+}
+static uint32_t esp_random(void) { return test_nonce++; }
+/* @CLIENT_ID@ */
 static bambu_state_t s_state[BAMBU_MACHINE_MAX], s_prev;
 static bool s_ever_data[BAMBU_MACHINE_MAX];
 static atomic_uint s_screen_wake_sequence;
@@ -34,6 +43,19 @@ static void report(int machine, const char *json) { parse_report(machine,json,(i
 int main(int argc, char **argv) {
     assert(argc == 2);
     const char *scenario = argv[1];
+    if (!strcmp(scenario,"client-id")) {
+        char first[24], other[24], reboot[24];
+        test_nonce = 42; make_client_id(first, sizeof(first));
+        test_nonce = 42; test_mac[5]++; make_client_id(other, sizeof(other));
+        assert(strcmp(first, other) && strlen(first) == 22 && strlen(other) == 22);
+        test_nonce = 43; make_client_id(reboot, sizeof(reboot));
+        assert(strcmp(other, reboot));
+        assert(!strncmp(first, "bbl_", 4));
+        assert(strspn(first+4, "0123456789abcdef") == strlen(first)-4);
+        test_mac_valid = false; make_client_id(reboot, sizeof(reboot));
+        assert(strlen(reboot) <= 23 && !strncmp(reboot, "bbl_", 4));
+        return 0;
+    }
     s_restore_slot = remembered_slot = 5; // AMS4 physical slot, not navigation index.
     s_slot[0]=0; s_slot[1]=8; s_slot[2]=1; s_slot[3]=6; s_slot[4]=7; s_pages_n=5;
     refresh_all();
