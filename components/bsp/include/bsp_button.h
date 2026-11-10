@@ -31,7 +31,7 @@ typedef void (*bsp_btn_cb_t)(bsp_btn_t btn, bsp_btn_ev_t ev, void *user);
 esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user);
 
 // deep sleep 专用:停掉三个按键设备、释放共享 ADC unit,再把按键脚交回普通数字输入
-// 并开启上拉(与板上 10k 外部上拉并联)。level 回填当时该脚电平,1 = 松开。
+// 使用板上 10k 外部上拉，不叠加内部上拉。level 回填当时该脚电平,1 = 松开。
 //
 // 为什么必须这样做:ADC 接管后该脚的【数字】电平读回是 0 —— 而 deep sleep 的低电平
 // 唤醒比的正是这个值。不恢复数字输入,唤醒条件在入睡瞬间就成立,设备会立刻醒回来。

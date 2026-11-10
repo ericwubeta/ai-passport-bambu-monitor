@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define SCREEN_IDLE_TIMEOUT_US (30LL * 1000 * 1000)
+#define SCREEN_POWEROFF_TIMEOUT_US (10LL * 60 * 1000 * 1000)
 
 // Classify display wake events independently of sound notifications.
 bool screen_print_wake_transition(const char *previous, const char *current);
@@ -30,3 +31,12 @@ void screen_idle_init(screen_idle_state_t *state, int64_t now_us);
 void screen_idle_activity(screen_idle_state_t *state, int64_t now_us);
 // true requests screen-off; the executor gives pending wake requests priority.
 bool screen_idle_poll(screen_idle_state_t *state, bool usb_connected, bool printing, int64_t now_us);
+
+// Terminal power-off is independent of the display's wake and idle policies.
+typedef struct {
+    bool counting;
+    int64_t eligible_since_us;
+} screen_poweroff_state_t;
+void screen_poweroff_reset(screen_poweroff_state_t *state);
+bool screen_poweroff_poll(screen_poweroff_state_t *state, bool screen_off,
+                         bool usb_connected, bool active_job, bool wake_pending, int64_t now_us);

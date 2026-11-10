@@ -6,6 +6,7 @@
 #include "app_notify.h"
 #include "app_screen_policy.h"
 #define CONFIG_PM_ENABLE 1
+#define BSP_BTN_MV_RELEASED_MIN 1900
 static int64_t now_us = 1000000;
 static screen_wake_state_t s_wake_policy = {.usb_connected=true};
 static screen_idle_state_t s_idle_policy = {.idle_since_us=1000000};
@@ -21,6 +22,9 @@ static int sounds;
 #define xSemaphoreTake(...) 1
 #define xSemaphoreGive(...) ((void)0)
 static bool bsp_battery_usb_connected(void) { return usb_connected; }
+bool app_poweroff_committed(void) { return false; }
+bool app_poweroff_activity(void) { return true; }
+void app_poweroff_poll(bool off, bool pending) {}
 static bool bsp_lvgl_lock(int timeout) { return lvgl_available; }
 static void bsp_lvgl_unlock(void) {}
 static void app_printer_set_suspended(bool value) { printer_suspended = value; }
@@ -36,6 +40,7 @@ void app_notify_trigger(notify_kind_t kind) { sounds++; }
 /* @WAKE@ */
 /* @TICK@ */
 /* @KEY@ */
+/* @BOOT_KEY@ */
 static void tick(int seconds) { now_us = seconds * 1000000LL; screen_off_tick(NULL); }
 static void assert_dark(void) {
     assert(s_screen_off && backlight == 0 && printer_suspended && lvgl_suspended && awake_balance == 0);
@@ -67,7 +72,16 @@ int main(int argc, char **argv) {
     const char *scenario = argv[1];
     reset();
     s_state[0].cloud = BAMBU_CLOUD_ONLINE;
-    if (!strcmp(scenario, "inactive")) {
+    if (!strcmp(scenario, "boot-key")) {
+        boot_key_gesture(true,3300); assert(!screen_off_on_key(BSP_BTN_PRESS));
+        boot_key_gesture(true,3300); assert(screen_off_on_key(BSP_BTN_CLICK));
+        assert(!screen_off_on_key(BSP_BTN_PRESS));
+        boot_key_gesture(true,300); assert(screen_off_on_key(BSP_BTN_PRESS));
+        assert(screen_off_on_key(BSP_BTN_RELEASE)); assert(screen_off_on_key(BSP_BTN_CLICK));
+        assert(!screen_off_on_key(BSP_BTN_PRESS));
+        boot_key_gesture(false,3300); assert(!screen_off_on_key(BSP_BTN_PRESS));
+        boot_key_gesture(false,0); assert(screen_off_on_key(BSP_BTN_PRESS));
+    } else if (!strcmp(scenario, "inactive")) {
         const char *states[] = {"", "IDLE", "PAUSE", "FINISH", "FAILED", "PREPARE"};
         for (int power = 0; power <= 1; power++) {
             for (unsigned i = 0; i < sizeof(states)/sizeof(states[0]); i++) {

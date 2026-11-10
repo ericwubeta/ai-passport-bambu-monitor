@@ -21,12 +21,14 @@
 #include "app_mqtt.h"
 #include "app_camera.h"
 #include "app_screen_policy.h"
+#include "app_poweroff.h"
 #include "font_zh.h"
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_pm.h"
+#include "esp_sleep.h"
 #include "driver/usb_serial_jtag.h"
 
 static const char *TAG = "main";
@@ -54,6 +56,7 @@ static esp_pm_lock_handle_t s_awake_lock;
 static void usb_guard_cb(void *arg)
 {
     (void)arg;
+    if (app_poweroff_committed()) return;
     if (usb_serial_jtag_is_connected()) return;      // 还连着 USB,继续禁止 light sleep
     if (s_usb_lock) esp_pm_lock_release(s_usb_lock); // 已断线:放锁,自动 light sleep 生效
     if (s_usb_timer) esp_timer_stop(s_usb_timer);    // 断线后没必要再复查
@@ -89,6 +92,7 @@ static void pm_init(void)
 
 static bool screen_wake(void)
 {
+    if (!app_poweroff_activity()) return false;
     if (!s_screen_off) return true;
     if (!bsp_lvgl_lock(200)) return false;
 #if CONFIG_PM_ENABLE
@@ -106,13 +110,16 @@ static bool screen_wake(void)
 static void screen_off_tick(void *arg)
 {
     (void)arg;
+    if (app_poweroff_committed()) return;
     bool usb_connected = bsp_battery_usb_connected();
     if (usb_connected != s_wake_policy.usb_connected) {
         ESP_LOGI(TAG, "USB host power=%d, screen_off=%d", usb_connected, s_screen_off);
     }
     bool sleep_due = screen_idle_poll(&s_idle_policy, usb_connected,
                                       app_mqtt_any_printing(), esp_timer_get_time());
-    if (screen_wake_poll(&s_wake_policy, usb_connected, app_mqtt_screen_wake_sequence())) {
+    bool wake_pending = screen_wake_poll(&s_wake_policy, usb_connected, app_mqtt_screen_wake_sequence());
+    app_poweroff_poll(s_screen_off, wake_pending);
+    if (wake_pending) {
         // Wake wins over a simultaneous timeout. Keep the request pending if
         // the LVGL lock is busy, and start its 30 seconds only after success.
         if (screen_wake()) {
@@ -133,6 +140,7 @@ static void screen_off_tick(void *arg)
 #endif
     // Network and event checks keep running while the display is suspended.
     s_screen_off = true;
+    app_poweroff_poll(true, false);
     bsp_lvgl_unlock();
     ESP_LOGI(TAG, "空闲 30s,熄屏");
 }
@@ -154,6 +162,7 @@ static void screen_off_init(void)
 // true = 这次按键只用于唤醒,不再往下处理。
 static bool screen_off_on_key(bsp_btn_ev_t ev)
 {
+    if (!app_poweroff_activity()) return true;
     screen_idle_activity(&s_idle_policy, esp_timer_get_time());
     if (s_screen_off) {
         screen_wake_request(&s_wake_policy);
@@ -290,6 +299,11 @@ static void boot_done(void) {
 #endif
 }
 
+static void boot_key_gesture(bool deep_wake, int mv) {
+    s_swallow_released = mv >= BSP_BTN_MV_RELEASED_MIN;
+    s_swallow_key = deep_wake || !s_swallow_released;
+}
+
 void app_main(void) {
 #ifdef NOTIFY_TRANSITION_SELFTEST
     extern void notify_transition_selftest(void);
@@ -300,6 +314,9 @@ void app_main(void) {
     camera_geometry_selftest();
 #endif
     ESP_LOGI(TAG, "AI Passport 打印机固件启动");
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    ESP_LOGI(TAG, "Boot wake=%s", wake_cause == ESP_SLEEP_WAKEUP_GPIO ? "button" :
+             wake_cause == ESP_SLEEP_WAKEUP_TIMER ? "timer" : "reset");
 
     bsp_i2c_init();
     bsp_i2c_scan();
@@ -314,7 +331,9 @@ void app_main(void) {
     bsp_display_backlight(100);
     screen_off_init();
 
+    s_swallow_key = true;
     s_ok[0] = (bsp_button_init(on_key, NULL) == ESP_OK);   // 页面导航依赖按键
+    if (s_ok[0]) boot_key_gesture(wake_cause == ESP_SLEEP_WAKEUP_GPIO, bsp_button_read_mv());
     s_ok[1] = true;                                        // 配网页常驻可用(修:原来进不去)
     s_ok[2] = true;                                        // 切网页:依赖已保存 WiFi 列表
     bsp_audio_init();                                       // 提示音(完成/失败/HMS)

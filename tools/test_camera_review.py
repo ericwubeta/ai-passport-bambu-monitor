@@ -47,7 +47,7 @@ class CameraReviewTests(unittest.TestCase):
         cls.work = Path(cls.directory.name)
         cls.executables = {}
         sources = {name: (ROOT / "main" / f"app_{name}.c").read_text(encoding="utf-8")
-                   for name in ["camera", "mqtt", "printer", "config", "provision"]}
+                   for name in ["camera", "mqtt", "printer", "config", "provision", "poweroff"]}
         main = (ROOT / "main/main.c").read_text(encoding="utf-8")
         reader = re.search(r"typedef struct \{.*?\} camera_reader_t;", sources["camera"], re.S).group()
         mqtt = sources["mqtt"][sources["mqtt"].index("static void sanitize_job"):sources["mqtt"].index("static void push_pushall")]
@@ -56,7 +56,7 @@ class CameraReviewTests(unittest.TestCase):
             "power": {"PRINTING": function(sources["mqtt"], "app_mqtt_any_printing"),
                       "SEQUENCE": function(sources["mqtt"], "app_mqtt_screen_wake_sequence"), "MQTT": mqtt,
                       "WAKE": function(main, "screen_wake"), "TICK": function(main, "screen_off_tick"),
-                      "KEY": function(main, "screen_off_on_key")},
+                      "KEY": function(main, "screen_off_on_key"), "BOOT_KEY": function(main, "boot_key_gesture")},
             "worker": {"READER": reader, "CURRENT": function(sources["camera"], "current"),
                        "CLOSE": function(sources["camera"], "close_camera"),
                        "STATUS": function(sources["camera"], "status"), "WORKER": function(sources["camera"], "worker")},
@@ -74,6 +74,10 @@ class CameraReviewTests(unittest.TestCase):
                        "OUTPUT": function(sources["camera"], "jpeg_output"),
                        "DECODE": function(sources["camera"], "decode")},
             "pages": {"PAGES": function(sources["printer"], "apply_page_vis")},
+            "poweroff": {"ACTIVE_JOB": function(sources["mqtt"], "app_mqtt_has_active_job"),
+                         **{marker: function(sources["poweroff"], name) for marker, name in {
+                            "COMMITTED":"app_poweroff_committed", "ACTIVITY":"app_poweroff_activity",
+                            "FINISHED":"request_finished", "TASK":"poweroff_task", "POLL":"app_poweroff_poll"}.items()}},
             "pin": {"READER": reader, "CURRENT": function(sources["camera"], "current"),
                     "CONNECT": function(sources["camera"], "connect_camera")},
             "topology": {"MQTT": mqtt, "CLIENT_ID": function(sources["mqtt"], "make_client_id"),
@@ -147,6 +151,29 @@ class CameraReviewTests(unittest.TestCase):
 
     def test_mqtt_client_ids_distinguish_boards_and_boots(self):
         self.run_case("topology", "client-id")
+
+    def test_poweroff_exact_ten_minutes_and_single_deferred_request(self):
+        self.run_case("poweroff", "normal")
+
+    def test_deep_wake_consumes_only_the_boot_gesture_not_the_next_press(self):
+        self.run_case("power", "boot-key")
+
+    def test_poweroff_guards_all_known_active_jobs_even_offline(self):
+        self.run_case("poweroff", "guards")
+
+    def test_poweroff_countdown_resets_on_activity_power_wake_and_clock_reset(self):
+        self.run_case("poweroff", "reset")
+
+    def test_poweroff_pending_execution_rechecks_inputs_and_wake_priority(self):
+        for case in ["queued-key","queued-usb","queued-print","queued-event","queued-wake","lock-busy","adc-error","held","oom"]:
+            self.run_case("poweroff", case)
+
+    def test_poweroff_terminal_failures_and_new_activity_restart_safely(self):
+        for case in ["late-usb","late-key","late-print","gpio-low","pm-error","wifi-error","battery-error","i2c-error","display-error","button-error","wake-error"]:
+            self.run_case("poweroff", case)
+
+    def test_poweroff_without_started_wifi_still_configures_gpio_wake(self):
+        self.run_case("poweroff", "wifi-not-started")
 
     def test_inactive_print_states_sleep_with_or_without_usb(self):
         self.run_case("power", "inactive")

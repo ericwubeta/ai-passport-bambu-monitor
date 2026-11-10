@@ -73,6 +73,8 @@ CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
 # USB 连着时禁止自动 light sleep,否则 USB-Serial-JTAG 控制台会在休眠中断流。
 # 拔线用电池时自动释放该锁,light sleep 正常生效。
 CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
+# GPIO0 has an external 10k pull-up shared by the three-key resistor ladder.
+# CONFIG_ESP_SLEEP_GPIO_ENABLE_INTERNAL_RESISTORS is not set
 # 按键扫描 5ms → 20ms:5ms 的 esp_timer 周期性唤醒会完全堵死 light sleep。
 # 去抖 2 tick = 40ms,短按 180ms / 长按 500ms 的判定精度仍然足够。
 CONFIG_BUTTON_PERIOD_TIME_MS=20

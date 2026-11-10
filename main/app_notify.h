@@ -17,3 +17,5 @@ void app_notify_init(void);
 
 // 请求播放提示音(非阻塞,立即返回;播放放独立任务)。
 void app_notify_trigger(notify_kind_t kind);
+// Terminal shutdown: suppress new tones and wait for codec/I2S use to finish.
+void app_notify_stop(void);

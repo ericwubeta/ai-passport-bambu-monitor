@@ -248,10 +248,11 @@ esp_err_t bsp_button_prepare_deep_sleep(int *level) {
         return err;
     }
 
-    // ② 按键脚交回普通数字输入 + 上拉(与板上 10k 外部上拉并联)。
+    // ② Use the board's external 10k pull-up; a second internal pull-up would
+    // shift the shared resistor ladder. Keep internal sleep pulls disabled too.
     const gpio_num_t pin = (gpio_num_t)BSP_BTN_GPIO;
     err = gpio_set_direction(pin, GPIO_MODE_INPUT);
-    if (err == ESP_OK) err = gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
+    if (err == ESP_OK) err = gpio_set_pull_mode(pin, GPIO_FLOATING);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "按键脚切回数字输入失败: %s", esp_err_to_name(err));
         return err;

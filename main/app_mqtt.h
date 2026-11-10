@@ -69,6 +69,8 @@ typedef struct {
 
 // 连接拓竹云并开始订阅(每台机器一个 report topic);每 30 秒给各机发 pushall。
 void app_mqtt_start(void);
+// Terminal shutdown: stop periodic requests and the network task.
+void app_mqtt_stop(void);
 
 // 配置的机器数(非空 SN 数,1..4)。
 int app_mqtt_machine_count(void);
@@ -82,6 +84,8 @@ void app_mqtt_snapshot(int idx, bambu_state_t *out);
 // True when any configured printer has cloud-online RUNNING state. Paused,
 // completed, failed and unknown/offline states do not keep the screen awake.
 bool app_mqtt_any_printing(void);
+// A known unfinished task (RUNNING/PAUSE/PREPARE) blocks power-off even offline.
+bool app_mqtt_has_active_job(void);
 
 // Monotonic event sequence for observed RUNNING entry / active -> FINISH.
 // Initial and duplicate snapshots do not advance it; independent of UI/power.

@@ -59,3 +59,11 @@ They cycle all pages and four AMS slots, verify stop-before-delete, retain widge
 on repeated refresh and cancel control confirmation on leaving its page. MQTT
 client-ID cases distinguish two device MACs with the same nonce, another boot,
 and the fallback when MAC reading fails.
+
+Power-off cases compile the real deferred worker and request/policy functions.
+Virtual time checks the exact 600-second deadline and countdown resets. Stubs
+exercise new activity before/after commit, display-lock/input/allocation failures,
+all terminal hardware error paths, MQTT guards across multiple/offline unfinished
+jobs, and clearing old wake sources before GPIO-only deep sleep. Physical deep
+sleep and button restart are tested separately; accelerated diagnostics do not
+replace a real ten-minute battery/current measurement.

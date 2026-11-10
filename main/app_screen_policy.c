@@ -40,3 +40,20 @@ bool screen_idle_poll(screen_idle_state_t *state, bool usb_connected, bool print
     }
     return !protected && now_us - state->idle_since_us >= SCREEN_IDLE_TIMEOUT_US;
 }
+
+void screen_poweroff_reset(screen_poweroff_state_t *state) {
+    *state = (screen_poweroff_state_t){0};
+}
+
+bool screen_poweroff_poll(screen_poweroff_state_t *state, bool screen_off,
+                         bool usb_connected, bool active_job, bool wake_pending, int64_t now_us) {
+    if (!screen_off || usb_connected || active_job || wake_pending) {
+        screen_poweroff_reset(state);
+        return false;
+    }
+    if (!state->counting || now_us < state->eligible_since_us) {
+        state->counting = true;
+        state->eligible_since_us = now_us;
+    }
+    return now_us - state->eligible_since_us >= SCREEN_POWEROFF_TIMEOUT_US;
+}

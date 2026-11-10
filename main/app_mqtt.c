@@ -40,6 +40,7 @@ static esp_err_t mqtt_tls_attach(void *config) {
 #define PUSH_PERIOD_US (30ULL * 1000000ULL)
 
 static esp_mqtt_client_handle_t s_cli;
+static esp_timer_handle_t s_push_timer;
 static SemaphoreHandle_t s_lock;
 static bambu_state_t s_state[BAMBU_MACHINE_MAX];   // 每台机器独立状态槽
 static int64_t s_conn_since;      // 云连接建立的时间戳(us)
@@ -797,15 +798,23 @@ void app_mqtt_start(void)
     }
 
     const esp_timer_create_args_t t = { .name = "bambu_push", .callback = push_timer_cb };
-    esp_timer_handle_t h;
-    esp_timer_create(&t, &h);
-    esp_timer_start_periodic(h, PUSH_PERIOD_US);
+    esp_timer_create(&t, &s_push_timer);
+    esp_timer_start_periodic(s_push_timer, PUSH_PERIOD_US);
     ESP_LOGI(TAG, "MQTT 启动:%s user=%s 机器=%d 台", BROKER_HOST, s_uid, s_mcount);
 }
 
 int app_mqtt_machine_count(void)
 {
     return s_mcount;
+}
+
+void app_mqtt_stop(void)
+{
+    if (s_push_timer) esp_timer_stop(s_push_timer);
+    if (s_cli) {
+        esp_err_t err = esp_mqtt_client_stop(s_cli);
+        if (err != ESP_OK) ESP_LOGW(TAG, "MQTT stop: %s", esp_err_to_name(err));
+    }
 }
 
 void app_mqtt_request_now(int idx)
@@ -865,6 +874,22 @@ bool app_mqtt_any_printing(void)
     }
     xSemaphoreGive(s_lock);
     return printing;
+}
+
+bool app_mqtt_has_active_job(void)
+{
+    if (!s_lock) return false;
+    bool active = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_mcount; i++) {
+        const char *state = s_state[i].gcode_state;
+        if (!strcmp(state, "RUNNING") || !strcmp(state, "PAUSE") || !strcmp(state, "PREPARE")) {
+            active = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return active;
 }
 
 void app_mqtt_snapshot(int idx, bambu_state_t *out)
