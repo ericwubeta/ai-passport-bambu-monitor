@@ -1,18 +1,31 @@
-# AI Passport · 拓竹 3D 打印机监控固件
+# PrintPet 固件
 
-English | [简体中文](README.zh_CN.md)
+[English](README.md) | 简体中文
 
-基于 [FoloToy AI Passport](https://github.com/FoloToy/ai-passport) 硬件（ESP32-C3）的可穿戴拓竹打印机监控固件。
-订阅拓竹云 MQTT 实时数据流，在 240×320 圆角屏上显示打印进度、温度、AMS 料槽和设备信息，无需掏出手机。
+面向拓竹打印机的社区 3D 打印伴侣固件，运行在第三方 [FoloToy AI Passport](https://github.com/FoloToy/ai-passport) 硬件上。AI Passport 是 FoloToy 的硬件名称，PrintPet 是本项目的软件品牌；本项目与 FoloToy、Bambu Lab 无官方关联或背书。
 
-## 功能
+## 产品线
+
+- **PrintPet Core**：1.x 核心监控线，显示进度、温度、AMS 耗材、HMS 告警与设备信息，没有精灵角色或角色语音。`v1.5.0` 是已公开的历史源码 tag，旧版行为差异见下节。
+- **PrintPet Spirit**：2.x 在核心监控基础上增加精灵动画、逐页台词/语音、状态事件语音及音量/亮度设置。当前 `2.1.8` 仍在内测，源码和固件尚未公开到 GitHub，没有公开 tag 或 release。
+
+两条线共用 FoloToy AI Passport 硬件和配网流程。Windows 桌面软件继续叫 **PrintPet - 打印小监工**，下载见 [PrintPet Releases](https://github.com/ericwubeta/PrintPet-releases)。同品牌不代表固件具有桌面 AI 聊天能力，也不代表两端已实现联动。
+
+## 只读定位与历史版本差异
+
+当前产品边界是只读监控：不发送暂停、继续、停止或灯控指令。用于获取状态的 `pushall` / `get_version` 请求不属于打印控制。
+
+**公开历史 `v1.5.0` 源码仍包含控制页及 `app_mqtt_print_command` / `app_mqtt_set_chamber_light` 发送入口，与当前只读定位有差异。** 本次仅统一命名和文档，未改写历史 tag、未发布新的 Core 固件；不能把旧 tag 或旧镜像视为已经完成只读收敛的构建。该差异需要在后续 Core 代码整理和验收中处理。
+
+仓库现名为 [ericwubeta/printpet-firmware](https://github.com/ericwubeta/printpet-firmware)。构建标识和产物名 `passport_printer` / `passport_printer.bin` 保留兼容，不作为产品名称。
+
+## Core 监控功能
 
 - **实时进度**：状态、百分比、层数/喷嘴点数、已用/剩余时间
 - **温度监控**：热床、喷嘴、腔体温度的目标值/当前值
 - **AMS 料槽**：最多 4 台 AMS × 4 槽，显示材质、颜色、料名与剩余克数（正确处理无 RFID 的手动耗材）
 - **HMS 告警**：错误码显示在常驻状态条并播放提示音
 - **设备页**：打印机型号、序列号、固件版本与连接状态
-- **控制页**：通过云端通道下发暂停 / 继续 / 停止 / 腔灯指令（打印机是否执行取决于账号权限，第三方 token 通常为只读）
 - **设备端配网**：热点 + 网页配置，WiFi 与拓竹凭据只存 NVS，不编进固件
 - **手机端短信登录**：配网页直接填拓竹手机号 + 验证码，设备自动获取 User ID / Token / 打印机序列号，全程不用电脑
 - **WiFi 扫描点选**：配网页扫描附近 2.4GHz 网络，手机上点选即填 SSID，已存网络可删除
@@ -31,9 +44,11 @@ English | [简体中文](README.zh_CN.md)
   <em>打印进度:状态、温度、层数、剩余时间</em>
 </p>
 
-| AMS 料槽 | 打印控制 | 开机动画 |
-| :---: | :---: | :---: |
-| <img src="docs/images/page-ams.jpg" width="240"> | <img src="docs/images/page-control.jpg" width="240"> | <img src="docs/images/boot.jpg" width="240"> |
+以下是 v1.5.0 历史截图，不代表尚未公开的 Spirit 界面或新品牌落款。
+
+| AMS 料槽 | 开机动画 |
+| :---: | :---: |
+| <img src="docs/images/page-ams.jpg" width="240"> | <img src="docs/images/boot.jpg" width="240"> |
 
 ## 硬件
 

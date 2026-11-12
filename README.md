@@ -1,18 +1,31 @@
-# AI Passport · Bambu Lab Printer Monitor
+# PrintPet Firmware
 
 [简体中文](README.zh_CN.md) | English
 
-A wearable Bambu Lab 3D-printer monitor built on the [FoloToy AI Passport](https://github.com/FoloToy/ai-passport) hardware (ESP32-C3).
-It subscribes to the Bambu Cloud MQTT stream and shows live print status, temperatures, AMS filament slots and device info on the 240×320 round-corner display — no phone needed.
+A community 3D-printing companion for Bambu Lab printers, running on third-party [FoloToy AI Passport](https://github.com/FoloToy/ai-passport) hardware. AI Passport is FoloToy's hardware name; PrintPet is this project's software brand. This community derivative is not affiliated with or endorsed by FoloToy or Bambu Lab.
 
-## Features
+## Product lines
+
+- **PrintPet Core**: the 1.x monitoring line for progress, temperatures, AMS filament, HMS alerts and device information, without character animation or character speech. The public `v1.5.0` source tag is a historical snapshot; see its behavior difference below.
+- **PrintPet Spirit**: the 2.x line adds character animation, per-page dialogue and voice, state-event voice, and volume/brightness settings to the core monitoring experience. Version `2.1.8` remains in internal testing. Its source and firmware have not been published on GitHub, and it has no public tag or release.
+
+Both lines use FoloToy AI Passport hardware and the same provisioning flow. The Windows desktop product remains **PrintPet - 打印小监工**, available from [PrintPet Releases](https://github.com/ericwubeta/PrintPet-releases). Sharing a brand does not imply desktop AI chat in the firmware or implemented synchronization between the two products.
+
+## Read-only scope and historical-version difference
+
+The current product scope is read-only monitoring: no pause, resume, stop or light-control commands. Telemetry requests such as `pushall` and `get_version` are not printer-control commands.
+
+**The historical public `v1.5.0` source still contains a control page and the `app_mqtt_print_command` / `app_mqtt_set_chamber_light` sending APIs. This differs from the current read-only scope.** This naming/documentation update does not rewrite that tag or publish a new Core firmware build. Do not describe an old tag or binary as an updated, verified read-only build; the legacy paths need separate Core code cleanup and validation.
+
+The firmware repository is [ericwubeta/printpet-firmware](https://github.com/ericwubeta/printpet-firmware). The `passport_printer` build identifier and `passport_printer.bin` artifact name remain compatible identifiers, not product names.
+
+## Core monitoring features
 
 - **Live print status** — state, progress %, layer/nozzle counts, elapsed/remaining time
 - **Temperatures** — bed, nozzle and chamber target/current values
 - **AMS filament** — up to 4 AMS × 4 slots: material, color, name and remaining grams (manual spools without RFID are handled correctly)
 - **HMS alerts** — error codes shown in the status bar with a notification sound
 - **Device page** — printer model, serial, firmware and connection state
-- **Control page** — sends pause/resume/stop and chamber-light commands through the cloud channel (whether the printer executes them depends on the account; third-party tokens are typically read-only)
 - **On-device provisioning** — softAP + web page; Wi-Fi and Bambu credentials are stored in NVS, never compiled in
 - **Phone-only SMS login** — enter the Bambu phone number and SMS code on the provisioning page; the device fetches the User ID, token and printer serials by itself, no PC required
 - **Scan-and-pick Wi-Fi** — the provisioning page scans nearby 2.4 GHz networks; tap one to fill the SSID, and delete saved networks from the phone
@@ -31,9 +44,11 @@ It subscribes to the Bambu Cloud MQTT stream and shows live print status, temper
   <em>Print progress: state, temperatures, layers, remaining time</em>
 </p>
 
-| AMS filament slots | Print control | Boot animation |
-| :---: | :---: | :---: |
-| <img src="docs/images/page-ams.jpg" width="240"> | <img src="docs/images/page-control.jpg" width="240"> | <img src="docs/images/boot.jpg" width="240"> |
+These are historical v1.5.0 screenshots, not the unpublished Spirit UI or new branding.
+
+| AMS filament slots | Boot animation |
+| :---: | :---: |
+| <img src="docs/images/page-ams.jpg" width="240"> | <img src="docs/images/boot.jpg" width="240"> |
 
 ## Hardware
 

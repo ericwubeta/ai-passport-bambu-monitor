@@ -2,13 +2,23 @@
 
 ## Project Structure & Module Organization
 
-This repository is an ESP-IDF BSP and hardware demonstration for the ESP32-C3-based FoloToy AI Passport.
+This repository is PrintPet firmware for the third-party FoloToy AI Passport hardware (ESP32-C3, no PSRAM), a community derivative without FoloToy or Bambu Lab endorsement.
+
+## Product Names and Publication State
+
+- PrintPet Core is the 1.x monitoring line. The historical v1.5.0 tag still contains legacy printer-control paths; it has not been rewritten to meet the current read-only product scope.
+- PrintPet Spirit is the 2.x line with character animation and voice. Spirit 2.1.8 remains in internal testing; its source, assets and binaries are not published here. Naming maintenance does not authorize publishing them or creating tags/releases.
+- The Windows product remains PrintPet - 打印小监工. Sharing a brand does not imply firmware AI chat or cross-device synchronization.
+- AI Passport refers only to FoloToy's third-party hardware. Do not use it as the firmware product name or imply official affiliation.
+- Canonical firmware repository: ericwubeta/printpet-firmware. Preserve passport_printer build/artifact names and existing configuration identifiers for compatibility.
+
+## Project Structure
 
 - `components/bsp/include/`: public BSP APIs and the hardware pin/configuration source of truth (`bsp_pins.h`).
 - `components/bsp/src/`: display, button, audio, battery, and shared-I2C implementations.
-- `main/`: the LVGL menu and independent `demo_*.c` hardware validation pages. New demos should implement the `enter`, `exit`, and `key` interface declared in `demo.h`.
+- `main/`: firmware startup, printer telemetry, provisioning and LVGL pages. `demo.h` retains the menu lifecycle interface.
 - `sdkconfig.defaults`: reproducible target, console, LVGL, and memory defaults.
-- `README.md`: wiring, known hardware traps, and the required on-device acceptance checklist.
+- `README.md` / `README.zh_CN.md`: product lines, historical behavior differences, hardware and validation limits.
 
 Keep reusable hardware logic in `components/bsp`; keep board demonstration and UI behavior in `main`.
 
