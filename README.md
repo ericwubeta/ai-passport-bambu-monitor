@@ -6,16 +6,16 @@ A community 3D-printing companion for Bambu Lab printers, running on third-party
 
 ## Product lines
 
-- **PrintPet Core**: the 1.x monitoring line for progress, temperatures, AMS filament, HMS alerts and device information, without character animation or character speech. The public `v1.5.0` source tag is a historical snapshot; see its behavior difference below.
+- **PrintPet Core**: the 1.x monitoring line for progress, temperatures, AMS filament, HMS alerts and device information, without character animation or character speech. The current source builds the read-only **1.5.1 candidate**; no new tag, release or device acceptance is implied. The historical `v1.5.0` tag is unchanged.
 - **PrintPet Spirit**: the 2.x line adds character animation, per-page dialogue and voice, state-event voice, and volume/brightness settings to the core monitoring experience. Version `2.1.8` remains in internal testing. Its source and firmware have not been published on GitHub, and it has no public tag or release.
 
 Both lines use FoloToy AI Passport hardware and the same provisioning flow. The Windows desktop product remains **PrintPet - 打印小监工**, available from [PrintPet Releases](https://github.com/ericwubeta/PrintPet-releases). Sharing a brand does not imply desktop AI chat in the firmware or implemented synchronization between the two products.
 
 ## Read-only scope and historical-version difference
 
-The current product scope is read-only monitoring: no pause, resume, stop or light-control commands. Telemetry requests such as `pushall` and `get_version` are not printer-control commands.
+The current Core source is read-only monitoring: no control page, pause/resume/stop API or light-control API. It subscribes to printer reports and sends only a fixed `pushing.command = pushall` request for status refresh, including reconnect, the periodic poll and manual refresh. It exposes no arbitrary command/payload publisher.
 
-**The historical public `v1.5.0` source still contains a control page and the `app_mqtt_print_command` / `app_mqtt_set_chamber_light` sending APIs. This differs from the current read-only scope.** This naming/documentation update does not rewrite that tag or publish a new Core firmware build. Do not describe an old tag or binary as an updated, verified read-only build; the legacy paths need separate Core code cleanup and validation.
+**The historical public `v1.5.0` tag still contains a control page and the `app_mqtt_print_command` / `app_mqtt_set_chamber_light` sending APIs.** Those paths are removed from the current 1.5.1 source; the old tag and previously built binaries have not been rewritten. The new candidate was compiled and host-tested without accessing a printer, and has not been flashed or tested on physical hardware. Spirit source and assets remain unpublished.
 
 The firmware repository is [ericwubeta/printpet-firmware](https://github.com/ericwubeta/printpet-firmware). The `passport_printer` build identifier and `passport_printer.bin` artifact name remain compatible identifiers, not product names.
 
@@ -144,6 +144,8 @@ If you run two or more real printers and hit an issue, please open an issue — 
 
 ## Building
 
+Native transport/navigation checks are documented in [tests/host](tests/host/README.md). The transport test captures actual `app_mqtt.c` output for 1–4 dummy printers; the LVGL test covers the monitoring page cycle, 0–4 AMS, refresh buttons and overview/detail reentry. Fixtures do not establish real multi-printer or device-memory acceptance.
+
 Requires ESP-IDF **5.5.x** (tested with 5.5 release on Windows).
 
 ```bash
@@ -159,7 +161,7 @@ Flashing keeps NVS, so re-flashing does not erase provisioning data.
 
 ```
 main/
-  app_printer.c     monitor UI: status / temps / AMS / device / control pages
+  app_printer.c     read-only UI: status / temperatures / AMS / device pages
   app_mqtt.c        Bambu Cloud MQTT client + JSON telemetry parsing
   app_provision.c   softAP + HTTP provisioning page
   app_config.c      NVS-backed credential store

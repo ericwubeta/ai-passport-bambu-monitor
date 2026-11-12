@@ -18,5 +18,6 @@ idf_component_register(
     REQUIRES bsp esp_wifi nvs_flash esp_event esp_netif esp_timer esp_pm esp_driver_usb_serial_jtag esp_http_server esp_http_client mqtt json mbedtls
 )
 
-# 固件版本宏(取自 CMake project VERSION,供设备页显示)
-target_compile_definitions(${COMPONENT_LIB} PUBLIC FW_VERSION="${PROJECT_VERSION}")
+# 从 ESP-IDF 构建属性读取版本，避免组件作用域中的 PROJECT_VERSION 为空。
+idf_build_get_property(printpet_firmware_version PROJECT_VER)
+target_compile_definitions(${COMPONENT_LIB} PUBLIC FW_VERSION="${printpet_firmware_version}")

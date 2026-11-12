@@ -12,7 +12,6 @@
 #include "app_config.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -609,6 +608,7 @@ static void parse_report(int idx, const char *data, int len)
 static void push_pushall(int idx)
 {
     if (!s_cli || idx < 0 || idx >= s_mcount) return;
+    // Core 的唯一出站 MQTT 请求:固定 pushall 获取状态，不接受任意命令或载荷。
     char topic[48], payload[40];
     snprintf(topic, sizeof(topic), "device/%s/request", sn_at(idx));
     snprintf(payload, sizeof(payload), "{\"pushing\":{\"command\":\"pushall\"}}");
@@ -760,39 +760,6 @@ int app_mqtt_machine_count(void)
 void app_mqtt_request_now(int idx)
 {
     push_pushall(idx);
-}
-
-// 发布到 device/<sn>/request。拓竹 OpenBambuAPI 命令格式:
-//   打印控制 {"print":{"sequence_id":"<n>","command":"pause|resume|stop","param":""}}(QoS 1)
-//   腔灯     {"system":{"sequence_id":"<n>","command":"ledctrl","led_node":"chamber_light","led_mode":"on|off"}}
-static void publish_request(int idx, const char *payload, int qos)
-{
-    if (!s_cli) { ESP_LOGW(TAG, "MQTT 未连接,命令丢弃"); return; }
-    if (idx < 0 || idx >= s_mcount) { ESP_LOGW(TAG, "机器下标无效,命令丢弃"); return; }
-    char topic[48];
-    snprintf(topic, sizeof(topic), "device/%s/request", sn_at(idx));
-    int id = esp_mqtt_client_publish(s_cli, topic, payload, 0, qos, 0);
-    ESP_LOGI(TAG, "发布 %s -> %s(%s)", payload, topic, id < 0 ? "失败" : "成功");
-}
-
-void app_mqtt_print_command(int idx, const char *cmd)
-{
-    if (!cmd || (strcmp(cmd, "pause") && strcmp(cmd, "resume") && strcmp(cmd, "stop"))) return;
-    char payload[160];
-    snprintf(payload, sizeof(payload),
-             "{\"print\":{\"sequence_id\":\"%u\",\"command\":\"%s\",\"param\":\"\"}}",
-             (unsigned)esp_random(), cmd);
-    publish_request(idx, payload, 1);
-}
-
-void app_mqtt_set_chamber_light(int idx, bool on)
-{
-    char payload[192];
-    snprintf(payload, sizeof(payload),
-             "{\"system\":{\"sequence_id\":\"%u\",\"command\":\"ledctrl\","
-             "\"led_node\":\"chamber_light\",\"led_mode\":\"%s\"}}",
-             (unsigned)esp_random(), on ? "on" : "off");
-    publish_request(idx, payload, 0);
 }
 
 void app_mqtt_snapshot(int idx, bambu_state_t *out)

@@ -84,9 +84,3 @@ int app_mqtt_uptime_sec(void);
 // 第 idx 台机器的 SN / 自定义名称(NVS 优先,回落 secrets.h)。名称空则返回 NULL。
 const char *app_mqtt_sn(int idx);
 const char *app_mqtt_name(int idx);
-
-// 打印控制命令:cmd ∈ "pause" / "resume" / "stop"(QoS 1,发布到第 idx 台 request topic)。
-void app_mqtt_print_command(int idx, const char *cmd);
-
-// 腔灯开关命令(on=true 亮)。X2D 支持 chamber_light。
-void app_mqtt_set_chamber_light(int idx, bool on);

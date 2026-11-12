@@ -6,7 +6,7 @@ This repository is PrintPet firmware for the third-party FoloToy AI Passport har
 
 ## Product Names and Publication State
 
-- PrintPet Core is the 1.x monitoring line. The historical v1.5.0 tag still contains legacy printer-control paths; it has not been rewritten to meet the current read-only product scope.
+- PrintPet Core is the 1.x monitoring line. The current 1.5.1 source removes the control UI and actuator APIs and only emits fixed pushall telemetry requests. The historical v1.5.0 tag still contains the old paths and must not be rewritten.
 - PrintPet Spirit is the 2.x line with character animation and voice. Spirit 2.1.8 remains in internal testing; its source, assets and binaries are not published here. Naming maintenance does not authorize publishing them or creating tags/releases.
 - The Windows product remains PrintPet - 打印小监工. Sharing a brand does not imply firmware AI chat or cross-device synchronization.
 - AI Passport refers only to FoloToy's third-party hardware. Do not use it as the firmware product name or imply official affiliation.
@@ -34,7 +34,7 @@ idf.py flash monitor          # Flash the connected board and open logs
 idf.py fullclean              # Remove generated build state when configuration is stale
 ```
 
-There is no host-side automated test suite currently. Treat a clean `idf.py build` as the minimum check, then run every applicable item in the README acceptance checklist on real hardware.
+Treat a clean `idf.py build` as the minimum check. `tests/host/README.md` documents native MQTT transport and actual LVGL navigation tests with synthetic fixtures. Host tests do not establish physical multi-printer behavior or ESP32-C3 RAM margins. Device flashing and on-device acceptance require the applicable task authorization.
 
 ## Coding Style & Naming Conventions
 
