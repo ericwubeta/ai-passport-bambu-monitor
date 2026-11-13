@@ -6,7 +6,7 @@
 
 ## 产品线
 
-- **PrintPet Core**：1.x 核心监控线，显示进度、温度、AMS 耗材、HMS 告警与设备信息，没有精灵角色或角色语音。当前源码构建 **1.5.1 只读候选版**，不代表已打新 tag、发布 release 或完成实机验收；历史 `v1.5.0` tag 保持原样。
+- **PrintPet Core**：1.x 核心监控线，显示进度、温度、AMS 耗材、HMS 告警与设备信息，没有精灵角色或角色语音。**v1.5.1 已发布到 [GitHub Release](https://github.com/ericwubeta/printpet-firmware/releases/tag/v1.5.1)**，附应用固件与校验和；请按[仅应用区升级说明](docs/UPGRADE-v1.5.1.md)操作。本次二进制的实机验收仍待完成，历史 `v1.5.0` tag 保持原样。
 - **PrintPet Spirit**：2.x 在核心监控基础上增加精灵动画、逐页台词/语音、状态事件语音及音量/亮度设置。当前 `2.1.8` 仍在内测，源码和固件尚未公开到 GitHub，没有公开 tag 或 release。
 
 两条线共用 FoloToy AI Passport 硬件和配网流程。Windows 桌面软件继续叫 **PrintPet - 打印小监工**，下载见 [PrintPet Releases](https://github.com/ericwubeta/PrintPet-releases)。同品牌不代表固件具有桌面 AI 聊天能力，也不代表两端已实现联动。
@@ -15,7 +15,7 @@
 
 当前 Core 源码仅提供只读监控：没有控制页、暂停/继续/停止 API 或灯控 API。订阅打印机报告，连接/重连、定时轮询及手动刷新只发送固定的 `pushing.command = pushall` 状态查询，不提供任意命令/载荷发布接口。
 
-**历史公开 `v1.5.0` tag 仍包含控制页及 `app_mqtt_print_command` / `app_mqtt_set_chamber_light` 发送入口。** 当前 1.5.1 源码已删除这些路径，旧 tag 和已有镜像均未改写。新候选已完成编译与主机测试，本轮未连接打印机、未刷机、未做实机验收。Spirit 源码与资产仍未公开。
+**历史公开 `v1.5.0` tag 仍包含控制页及 `app_mqtt_print_command` / `app_mqtt_set_chamber_light` 发送入口。** 当前 1.5.1 源码已删除这些路径，旧 tag 和已有镜像均未改写。发布二进制已完成编译与主机测试，发布过程未连接打印机、未刷机，实机验收仍待完成。Spirit 源码与资产仍未公开。
 
 仓库现名为 [ericwubeta/printpet-firmware](https://github.com/ericwubeta/printpet-firmware)。构建标识和产物名 `passport_printer` / `passport_printer.bin` 保留兼容，不作为产品名称。
 
@@ -149,7 +149,7 @@ idf.py -p COM5 flash monitor
 ```
 
 分区表（`partitions.csv`）：8 MB Flash 上 NVS + PHY + 4 MB factory 应用。
-烧写不擦除 NVS，重新刷固件不会丢失配网信息。
+已有 Core 分区请按[应用区升级说明](docs/UPGRADE-v1.5.1.md)只写 `0x10000`，不擦全片、不使用 `0x0` 合并镜像，以保留 NVS 配置。
 
 ## 目录结构
 

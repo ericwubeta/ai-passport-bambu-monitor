@@ -6,7 +6,7 @@ A community 3D-printing companion for Bambu Lab printers, running on third-party
 
 ## Product lines
 
-- **PrintPet Core**: the 1.x monitoring line for progress, temperatures, AMS filament, HMS alerts and device information, without character animation or character speech. The current source builds the read-only **1.5.1 candidate**; no new tag, release or device acceptance is implied. The historical `v1.5.0` tag is unchanged.
+- **PrintPet Core**: the 1.x monitoring line for progress, temperatures, AMS filament, HMS alerts and device information, without character animation or character speech. **v1.5.1 is available as a [GitHub Release](https://github.com/ericwubeta/printpet-firmware/releases/tag/v1.5.1)** with the application firmware and checksums. Follow the [application-only upgrade guide](docs/UPGRADE-v1.5.1.md); physical acceptance of this binary remains pending. The historical `v1.5.0` tag is unchanged.
 - **PrintPet Spirit**: the 2.x line adds character animation, per-page dialogue and voice, state-event voice, and volume/brightness settings to the core monitoring experience. Version `2.1.8` remains in internal testing. Its source and firmware have not been published on GitHub, and it has no public tag or release.
 
 Both lines use FoloToy AI Passport hardware and the same provisioning flow. The Windows desktop product remains **PrintPet - 打印小监工**, available from [PrintPet Releases](https://github.com/ericwubeta/PrintPet-releases). Sharing a brand does not imply desktop AI chat in the firmware or implemented synchronization between the two products.
@@ -15,7 +15,7 @@ Both lines use FoloToy AI Passport hardware and the same provisioning flow. The 
 
 The current Core source is read-only monitoring: no control page, pause/resume/stop API or light-control API. It subscribes to printer reports and sends only a fixed `pushing.command = pushall` request for status refresh, including reconnect, the periodic poll and manual refresh. It exposes no arbitrary command/payload publisher.
 
-**The historical public `v1.5.0` tag still contains a control page and the `app_mqtt_print_command` / `app_mqtt_set_chamber_light` sending APIs.** Those paths are removed from the current 1.5.1 source; the old tag and previously built binaries have not been rewritten. The new candidate was compiled and host-tested without accessing a printer, and has not been flashed or tested on physical hardware. Spirit source and assets remain unpublished.
+**The historical public `v1.5.0` tag still contains a control page and the `app_mqtt_print_command` / `app_mqtt_set_chamber_light` sending APIs.** Those paths are removed from the current 1.5.1 source; the old tag and previously built binaries have not been rewritten. The published binary was compiled and host-tested without accessing a printer, and has not yet been flashed or accepted on physical hardware. Spirit source and assets remain unpublished.
 
 The firmware repository is [ericwubeta/printpet-firmware](https://github.com/ericwubeta/printpet-firmware). The `passport_printer` build identifier and `passport_printer.bin` artifact name remain compatible identifiers, not product names.
 
@@ -155,7 +155,7 @@ idf.py -p COM5 flash monitor
 ```
 
 Partition layout (`partitions.csv`): NVS + PHY + 4 MB factory app on 8 MB flash.
-Flashing keeps NVS, so re-flashing does not erase provisioning data.
+For an existing Core layout, the [application-only upgrade](docs/UPGRADE-v1.5.1.md) writes 0x10000 and preserves NVS. Do not erase all Flash or use a merged image at 0x0 for this upgrade.
 
 ## Project layout
 

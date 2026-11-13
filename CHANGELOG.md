@@ -2,14 +2,14 @@
 
 All notable changes to this project are documented here.
 
-## Unreleased — PrintPet Core 1.5.1
+## v1.5.1 — 2026-11-13 (PrintPet Core)
 
 - Remove the printer-control page, selection/stop-confirmation state, pause/resume/stop APIs, chamber-light API and generic command publisher.
 - Keep progress, temperatures, AMS, HMS/device data, multi-printer navigation and fixed `pushall` status refresh. OK on the progress page still toggles remaining time/ETA; other detail pages request status only.
 - Use PrintPet Core on the boot, menu and provisioning screens, keeping FoloToy AI Passport as the third-party hardware name. Read the displayed version from the ESP-IDF `PROJECT_VER` build property.
 - Add native tests that capture MQTT output and exercise the actual LVGL monitoring navigation with synthetic 1–4-printer and 0–4-AMS fixtures.
 
-The original v1.5.0 tag is unchanged. This source candidate is not a new tag/release or a physically accepted firmware build. Spirit remains unpublished.
+The original v1.5.0 tag is unchanged. The release includes an application-only image at 0x10000 and upgrade instructions. Build and host tests passed; physical acceptance of this binary remains pending. Spirit remains unpublished.
 
 ## v1.5.0 — 2026-10-31
 
