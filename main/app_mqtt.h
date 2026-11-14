@@ -61,6 +61,7 @@ typedef struct {
 
     bambu_ams_t ams[BAMBU_AMS_MAX];
     int   ams_count;         // 在位 AMS 台数(0=外部料筒或未知)
+    bool  ams_topology_known; // 已收到明确的 AMS 数组（包括空数组），不是普通状态增量
     bool  ams_active;        // true=AMS 当前料槽;false=外部料筒
     bambu_hms_t hms[BAMBU_HMS_MAX];
     int   hms_count;         // 当前 HMS 错误数(0=无)
@@ -68,6 +69,8 @@ typedef struct {
 
 // 连接拓竹云并开始订阅(每台机器一个 report topic);每 30 秒给各机发 pushall。
 void app_mqtt_start(void);
+// Terminal shutdown: stop periodic requests and the network task.
+void app_mqtt_stop(void);
 
 // 配置的机器数(非空 SN 数,1..4)。
 int app_mqtt_machine_count(void);
@@ -77,6 +80,16 @@ void app_mqtt_request_now(int idx);
 
 // 线程安全取第 idx 台机器的状态快照。从未收到过数据时 cloud 为 OFF/CONNECTING。
 void app_mqtt_snapshot(int idx, bambu_state_t *out);
+
+// True when any configured printer has cloud-online RUNNING state. Paused,
+// completed, failed and unknown/offline states do not keep the screen awake.
+bool app_mqtt_any_printing(void);
+// A known unfinished task (RUNNING/PAUSE/PREPARE) blocks power-off even offline.
+bool app_mqtt_has_active_job(void);
+
+// Monotonic event sequence for observed RUNNING entry / active -> FINISH.
+// Initial and duplicate snapshots do not advance it; independent of UI/power.
+uint32_t app_mqtt_screen_wake_sequence(void);
 
 // 云连接已维持的秒数(设备页显示用)。
 int app_mqtt_uptime_sec(void);

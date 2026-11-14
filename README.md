@@ -11,6 +11,10 @@ Read-only Bambu printer monitoring on third-party FoloToy AI Passport hardware: 
 
 Both use the new shared, identity-protected layout. Existing historical tags remain unchanged. The Windows desktop application is separate. Neither firmware controls printers, includes desktop AI chat, or synchronizes with the desktop app.
 
+## Camera monitoring and power
+
+The second detail page shows the supported printer's live LAN preview with FPS and print status. The device restores the last page on startup. After 10 minutes with the screen off, the device enters deep sleep if USB power is undetected and no known print is active. See [camera controls and compatibility](docs/CAMERA_UI.md) and [automatic power-off](docs/AUTO_POWEROFF.md).
+
 ## Complete installation / recovery packages
 
 The old 2.2.0 archive was an app/resource-only upgrade for a prior PrintPet layout, not a first-install or recovery image. An application flashed at 0x0 replaces boot information. Its old 4MiB layout also conflicts with the vendor Arduino identity reservation.

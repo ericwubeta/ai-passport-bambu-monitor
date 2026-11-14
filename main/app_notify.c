@@ -5,6 +5,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "bsp_audio.h"
 #include "esp_log.h"
@@ -51,6 +52,7 @@ static const note_t S_PAUSE[]  = { { 659, 90 },  { 0, 60 },   { 659, 130 }, { 0,
 static TaskHandle_t s_task;
 static volatile int s_req = -1;   // -1=空闲
 static volatile bool s_started;
+static atomic_bool s_stopping, s_busy;
 
 static void play_notes(const note_t *seq)
 {
@@ -87,11 +89,13 @@ static void notify_task(void *arg)
     for (;;) {
         // 没请求时彻底阻塞,既不轮询也不占 CPU;也不用抱着 codec 常开。
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        atomic_store(&s_busy, true);
+        if (atomic_load(&s_stopping)) { atomic_store(&s_busy, false); continue; }
 
         int k = s_req;
         s_req = -1;
-        if (k < NOTIFY_FINISH || k > NOTIFY_PAUSE) continue;
-        if (bsp_audio_set_format(SAMPLE_RATE, 16, 1) != ESP_OK) continue;
+        if (k < NOTIFY_FINISH || k > NOTIFY_PAUSE) { atomic_store(&s_busy, false); continue; }
+        if (bsp_audio_set_format(SAMPLE_RATE, 16, 1) != ESP_OK) { atomic_store(&s_busy, false); continue; }
         bsp_audio_set_volume(80);
         switch (k) {
         case NOTIFY_FINISH: play_notes(S_FINISH); break;
@@ -100,6 +104,7 @@ static void notify_task(void *arg)
         }
         vTaskDelay(pdMS_TO_TICKS(30));   // 等最后一段 DMA 送完,避免切断/爆音
         bsp_audio_close();              // 播完立即关 codec 与 I2S 时钟
+        atomic_store(&s_busy, false);
     }
 }
 
@@ -114,9 +119,17 @@ void app_notify_init(void)
 
 void app_notify_trigger(notify_kind_t kind)
 {
+    if (atomic_load(&s_stopping)) return;
     app_notify_init();
     if (kind >= NOTIFY_FINISH && kind <= NOTIFY_PAUSE) {
         s_req = (int)kind;
         xTaskNotifyGive(s_task);
     }
+}
+
+void app_notify_stop(void)
+{
+    atomic_store(&s_stopping, true);
+    while (atomic_load(&s_busy)) vTaskDelay(pdMS_TO_TICKS(10));
+    bsp_audio_close();
 }

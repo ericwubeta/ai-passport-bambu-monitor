@@ -6,30 +6,47 @@
 // username = u_<USER_ID>,password = accessToken,client_id 随机 bbl_xxx。
 #include "app_mqtt.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "app_config.h"
+#include "app_notify.h"
+#include "app_screen_policy.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "esp_random.h"
+#include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "mqtt_client.h"
+#include "mbedtls/ssl.h"
 
-#include "secrets.h"
+#include "app_secrets.h"
 
 static const char *TAG = "app_mqtt";
+
+static esp_err_t mqtt_tls_attach(void *config) {
+    esp_err_t err = esp_crt_bundle_attach(config);
+    if (err != ESP_OK) return err;
+    // Negotiate smaller TLS records without changing MQTT's complete-message
+    // buffer or parsing. This leaves contiguous RAM for camera TLS alongside it.
+    return mbedtls_ssl_conf_max_frag_len(config, MBEDTLS_SSL_MAX_FRAG_LEN_4096) == 0 ? ESP_OK : ESP_FAIL;
+}
 
 #define BROKER_HOST "cn.mqtt.bambulab.com"
 #define PUSH_PERIOD_US (30ULL * 1000000ULL)
 
 static esp_mqtt_client_handle_t s_cli;
+static esp_timer_handle_t s_push_timer;
 static SemaphoreHandle_t s_lock;
 static bambu_state_t s_state[BAMBU_MACHINE_MAX];   // 每台机器独立状态槽
 static int64_t s_conn_since;      // 云连接建立的时间戳(us)
 static bool s_ever_data[BAMBU_MACHINE_MAX];
+static atomic_uint s_screen_wake_sequence;
 
 // 凭据:NVS(配网写入)优先,空则回落 secrets.h。app_mqtt_start 时解析一次。
 static char s_uid[40];            // "u_<USER_ID>"
@@ -39,6 +56,21 @@ static char s_name[BAMBU_MACHINE_MAX][17]; // 自定义名称(可空)
 static int  s_mcount;             // 有效机器数 1..4
 
 static const char *sn_at(int i) { return s_sn[i]; }
+
+static void make_client_id(char *out, size_t size)
+{
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        // Boot time is similar on different boards. A duplicate MQTT client ID
+        // makes the broker evict the other connection, even with healthy TLS.
+        snprintf(out, size, "bbl_%02x%02x%02x%02x%02x%02x%06x",
+                 (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
+                 (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5],
+                 (unsigned)(esp_random() & 0xffffff));
+    } else {
+        snprintf(out, size, "bbl_%08x%08x", (unsigned)esp_random(), (unsigned)esp_random());
+    }
+}
 
 // topic → 机器下标:device/<SN>/report 形态,匹配配置的 SN 列表
 static int idx_from_topic(const char *topic, int tlen)
@@ -72,6 +104,7 @@ static void state_reset_online_part(bambu_state_t *st)
     st->job[0] = 0;
     st->printer_ip = 0;
     st->ams_count = 0;
+    st->ams_topology_known = false;
     st->ams_active = false;
     memset(st->ams, 0, sizeof(st->ams));
     st->hms_count = 0;
@@ -329,9 +362,16 @@ static bool jstr(const char *v, const char *ve, char *out, int n)
         if (_v) (dst) = jint(_v, _e, (dst)); \
     } while (0)
 
+static bool jarray(const char *value, const char *end) {
+    if (!value || !end) return false;
+    value = jskip_ws(value, end);
+    return value < end && *value == '[' && end[-1] == ']';
+}
+
 static void parse_report(int idx, const char *data, int len)
 {
     bambu_state_t *const st = &s_state[idx];
+    notify_kind_t notification = NOTIFY_NONE;
     // X2D 全量快照(含 AMS/2D 信息)可达 10~15KB,buffer 已配 20KB。
     // 轻量扫描不建树,内存 O(1),不受堆限制。
     if (len > 18 * 1024) return;
@@ -347,8 +387,14 @@ static void parse_report(int idx, const char *data, int len)
         v = jpath(pr, plen, "gcode_state", &ve);
         if (v) {
             char gs[10];
-            if (jstr(v, ve, gs, sizeof(gs))) {
+            if (jstr(v, ve, gs, sizeof(gs)) && gs[0]) {
+                notification = app_notify_transition(st->gcode_state, gs);
                 bool changed = strcmp(st->gcode_state, gs) != 0;
+                // Initial snapshots establish a baseline. Only subsequent
+                // entry into RUNNING or an active -> FINISH transition wakes.
+                if (screen_print_wake_transition(st->gcode_state, gs)) {
+                    atomic_fetch_add_explicit(&s_screen_wake_sequence, 1, memory_order_relaxed);
+                }
                 strlcpy(st->gcode_state, gs, sizeof(st->gcode_state));
                 // 状态切换到 IDLE / FINISH / FAILED 且不再是打印中:
                 // 清空残留的旧进度/层数/温度/任务,避免界面出现"空闲 + 53%"这种矛盾。
@@ -406,10 +452,15 @@ static void parse_report(int idx, const char *data, int len)
         // 闪没(全量 pushall 每 30 秒才来一次),故先探测再清。
         {
             const char *ae0 = NULL;
-            bool has_ams = jpath(pr, plen, "ams.ams[0]", &ae0) != NULL;
-            if (!has_ams) has_ams = jpath(pr, plen, "ams[0]", &ae0) != NULL;
+            const char *array = jpath(pr, plen, "ams.ams", &ae0);
+            bool has_ams = jarray(array, ae0);
+            if (!has_ams) {
+                array = jpath(pr, plen, "ams", &ae0);
+                has_ams = jarray(array, ae0);
+            }
 
             if (has_ams) {
+            st->ams_topology_known = true;
             int tray_now = 255;
             v = jpath(pr, plen, "ams.tray_now", &ve);
             if (v) tray_now = jint(v, ve, 255);   // jint 已兼容字符串/数字两种值
@@ -579,6 +630,13 @@ static void parse_report(int idx, const char *data, int len)
         xSemaphoreGive(s_lock);
     }
 
+    // Only an observed transition in this printer's real report may notify.
+    // The first historical FINISH snapshot after boot is merely a baseline.
+    if (notification != NOTIFY_NONE) {
+        ESP_LOGI(TAG, "printer=%d notification=%d", idx, notification);
+        app_notify_trigger(notification);
+    }
+
     // 节流打印提取摘要,便于确认解析与内存状态(INFO 级)
     {
         static int64_t s_last_summary;
@@ -605,10 +663,10 @@ static void parse_report(int idx, const char *data, int len)
 
 // ---------------------------------------------------------------- 事件
 
+// 只读刷新：请求打印机状态快照。
 static void push_pushall(int idx)
 {
     if (!s_cli || idx < 0 || idx >= s_mcount) return;
-    // Core 的唯一出站 MQTT 请求:固定 pushall 获取状态，不接受任意命令或载荷。
     char topic[48], payload[40];
     snprintf(topic, sizeof(topic), "device/%s/request", sn_at(idx));
     snprintf(payload, sizeof(payload), "{\"pushing\":{\"command\":\"pushall\"}}");
@@ -629,7 +687,7 @@ static void on_mqtt(void *handler_arg, esp_event_base_t base, int32_t id, void *
         // 每台机器各订阅 report topic,否则收不到推送
         for (int i = 0; i < s_mcount; i++) {
             char rt[48];
-            snprintf(rt, sizeof(rt), "device/%s/report", sn_at(i));
+            snprintf(rt, sizeof(rt), "device/%.*s/report", (int)sizeof(s_sn[0]) - 1, sn_at(i));
             esp_mqtt_client_subscribe(s_cli, rt, 0);
             ESP_LOGI(TAG, "已订阅 %s", rt);
             push_pushall(i);
@@ -674,7 +732,7 @@ void app_mqtt_start(void)
 
     // 凭据解析:NVS 优先,空则回落 secrets.h(老机器兼容)。
     device_config_t cfgc;
-    config_load(&cfgc);
+    config_load_printers(&cfgc);
     if (cfgc.bambu_uid[0]) {
         // NVS 存 "u_<id>" 或纯 id,统一成 "u_<id>"
         if (!strncmp(cfgc.bambu_uid, "u_", 2))
@@ -693,10 +751,6 @@ void app_mqtt_start(void)
         strlcpy(s_sn[i], cfgc.bambu_sn[i], sizeof(s_sn[i]));
         strlcpy(s_name[i], cfgc.bambu_name[i], sizeof(s_name[i]));
         if (s_sn[i][0]) s_mcount = i + 1;
-    }
-    if (!s_mcount) {
-        strlcpy(s_sn[0], CFG_BAMBU_SERIAL, sizeof(s_sn[0]));
-        s_mcount = 1;
     }
 
     // ===== 多机仿真测试开关(发版前必须置 0)=====
@@ -721,14 +775,14 @@ void app_mqtt_start(void)
         return;
     }
 
-    char cid[20];
-    snprintf(cid, sizeof(cid), "bbl_%06X", (unsigned)(esp_timer_get_time() >> 10) & 0xFFFFFF);
+    char cid[24];
+    make_client_id(cid, sizeof(cid));
 
     esp_mqtt_client_config_t cfg = { 0 };
     cfg.broker.address.hostname = BROKER_HOST;
     cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
     cfg.broker.address.port = 8883;
-    cfg.broker.verification.crt_bundle_attach = &esp_crt_bundle_attach;
+    cfg.broker.verification.crt_bundle_attach = mqtt_tls_attach;
     cfg.credentials.username = s_uid;
     cfg.credentials.authentication.password = s_tok;
     cfg.credentials.client_id = cid;   // IDF 5.5: client_id 在 credentials 下
@@ -746,9 +800,8 @@ void app_mqtt_start(void)
     }
 
     const esp_timer_create_args_t t = { .name = "bambu_push", .callback = push_timer_cb };
-    esp_timer_handle_t h;
-    esp_timer_create(&t, &h);
-    esp_timer_start_periodic(h, PUSH_PERIOD_US);
+    esp_timer_create(&t, &s_push_timer);
+    esp_timer_start_periodic(s_push_timer, PUSH_PERIOD_US);
     ESP_LOGI(TAG, "MQTT 启动:%s user=%s 机器=%d 台", BROKER_HOST, s_uid, s_mcount);
 }
 
@@ -757,9 +810,55 @@ int app_mqtt_machine_count(void)
     return s_mcount;
 }
 
+void app_mqtt_stop(void)
+{
+    if (s_push_timer) esp_timer_stop(s_push_timer);
+    if (s_cli) {
+        esp_err_t err = esp_mqtt_client_stop(s_cli);
+        if (err != ESP_OK) ESP_LOGW(TAG, "MQTT stop: %s", esp_err_to_name(err));
+    }
+}
+
 void app_mqtt_request_now(int idx)
 {
     push_pushall(idx);
+}
+
+uint32_t app_mqtt_screen_wake_sequence(void)
+{
+    return atomic_load_explicit(&s_screen_wake_sequence, memory_order_relaxed);
+}
+
+bool app_mqtt_any_printing(void)
+{
+    if (!s_lock) return false;
+    bool printing = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_mcount; i++) {
+        if (s_state[i].cloud == BAMBU_CLOUD_ONLINE &&
+            !strcmp(s_state[i].gcode_state, "RUNNING")) {
+            printing = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return printing;
+}
+
+bool app_mqtt_has_active_job(void)
+{
+    if (!s_lock) return false;
+    bool active = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_mcount; i++) {
+        const char *state = s_state[i].gcode_state;
+        if (!strcmp(state, "RUNNING") || !strcmp(state, "PAUSE") || !strcmp(state, "PREPARE")) {
+            active = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return active;
 }
 
 void app_mqtt_snapshot(int idx, bambu_state_t *out)

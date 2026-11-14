@@ -10,6 +10,9 @@ dependencies.lock
 *.bak
 main/secrets.h
 !main/secrets.h.example
+.local-backups/
+/build-camera-probe/
+/build-camera-ui/
 
 # 调试日志 / 串口抓取 / 临时探针
 *.log

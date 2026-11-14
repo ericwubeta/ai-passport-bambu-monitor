@@ -15,6 +15,7 @@
 #include <time.h>
 
 #include "app_config.h"
+#include "app_camera_config.h"
 #include "app_wifi.h"
 #include "bambu_ca.h"          // api.bambulab.cn 的中间 CA + 根 CA
 #include "bsp_display.h"      // bsp_lvgl_lock(网页线程更新屏幕要加锁)
@@ -40,7 +41,7 @@
 
 #include "nvs_flash.h"
 
-#include "secrets.h"
+#include "app_secrets.h"
 
 static const char *TAG = "provision";
 
@@ -63,7 +64,7 @@ static const char *PAGE_HTML =
 "h3{font-size:15px;margin:24px 0 4px}"
 "p{color:#6b7a8c;font-size:13px;line-height:1.6}"
 "label{display:block;margin:12px 0 4px;font-size:13px;color:#6b7a8c}"
-"input{width:100%;box-sizing:border-box;padding:10px;border-radius:6px;"
+"input,select{width:100%;box-sizing:border-box;padding:10px;border-radius:6px;"
 "border:1px solid #1e2a38;background:#141b25;color:#e6edf3;font-size:15px}"
 "button{margin-top:14px;width:100%;padding:12px;border:0;border-radius:6px;"
 "background:#00c853;color:#fff;font-size:16px;cursor:pointer}"
@@ -98,6 +99,17 @@ static const char *PAGE_HTML =
 "<label>短信验证码</label><input id='code' inputmode='numeric' maxlength='6'>"
 "<button id='loginBtn' onclick='doLogin()'>登录并完成配置</button>"
 "<p>登录成功后自动获取 Token、User ID 和账号下的打印机，无需手动填写。</p>"
+"<details><summary>Camera (optional)</summary>"
+"<p>Connect the printer and Passport to the same LAN. Configure each printer separately.</p>"
+"<label>Printer</label><select id='camidx' onchange='selectCamera()'></select>"
+"<label>Printer IP or hostname</label><input id='camhost' maxlength='63' placeholder='192.168.1.100'>"
+"<label>LAN access code (8 characters)</label><input id='camcode' type='password' maxlength='8' autocomplete='new-password'>"
+"<p id='camcodehint'>Leave blank to keep the saved code.</p>"
+"<label>Model / short name (optional)</label><input id='cammodel' maxlength='24'>"
+"<label>Camera source</label><select id='cammode'><option value='0'>Auto</option>"
+"<option value='1'>JPEG preview</option><option value='2'>A1 / P1 camera</option></select>"
+"<label><input id='campair' type='checkbox' style='width:auto'> Pair again after printer replacement / certificate change</label>"
+"<button onclick='saveCamera()'>Save camera and restart</button></details>"
 "<details><summary>高级：手动填 Token / 序列号</summary>"
 "<p>仅在接口异常或需要改单台配置时使用，正常流程不用管这里。</p>"
 "<label>拓竹 User ID（纯数字）</label><input id='uid' inputmode='numeric'>"
@@ -188,7 +200,19 @@ static const char *PAGE_HTML =
 "const b=f.map(k=>k+'='+enc($('#'+k).value)).join('&');"
 "const d=await jpost('/save',b);"
 "msg(d.ok?'已保存，设备即将重启…':(d.err||'保存失败'),d.ok?'ok':'err')}"
-"pollNet();setInterval(pollNet,3000);loadSaved();loadCfg();"
+"let cameras=[];async function loadCameras(){try{const d=await jget('/camera');cameras=d.machines||[];"
+"const sel=$('#camidx');sel.textContent='';cameras.forEach(c=>{const o=document.createElement('option');"
+"o.value=c.index;o.textContent=c.name||('Printer '+(c.index+1));sel.appendChild(o)});selectCamera()}catch(e){}}"
+"function selectCamera(){const c=cameras.find(c=>c.index===Number($('#camidx').value));if(!c)return;"
+"$('#camhost').value=c.host||'';$('#cammodel').value=c.model||'';$('#cammode').value=String(c.mode||0);"
+"$('#camcode').value='';$('#campair').checked=false;$('#camcodehint').textContent=c.has_code?"
+"'Code saved. Leave blank to keep it.':'Enter the LAN access code shown on the printer.'}"
+"async function saveCamera(){const b='idx='+enc($('#camidx').value)+'&host='+enc($('#camhost').value.trim())"
+"+'&code='+enc($('#camcode').value)+'&model='+enc($('#cammodel').value)+'&mode='+enc($('#cammode').value)"
+"+'&pair='+($('#campair').checked?'1':'0');try{const d=await jpost('/camera',b);"
+"msg(d.ok?'Camera saved. Restarting...':(d.err||'Camera save failed'),d.ok?'ok':'err')}"
+"catch(e){msg('Camera save failed','err')}}"
+"pollNet();setInterval(pollNet,3000);loadSaved();loadCfg();loadCameras();"
 "</script></body></html>";
 
 static const char *SAVED_HTML =
@@ -985,12 +1009,80 @@ static esp_err_t save_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t camera_get_handler(httpd_req_t *req) {
+    device_config_t devices;
+    config_load_printers(&devices);
+    int used = snprintf(s_buf, SBUF, "{\"machines\":[");
+    bool first = true;
+    for (int i = 0; i < CFG_MACHINE_MAX; i++) {
+        if (!devices.bambu_sn[i][0]) continue;
+        camera_config_t camera;
+        camera_config_load(devices.bambu_sn[i], &camera);
+        char name[36], host[130], model[52];
+        json_str(devices.bambu_name[i], name, sizeof(name));
+        json_str(camera.host, host, sizeof(host));
+        json_str(camera.model, model, sizeof(model));
+        int n = snprintf(s_buf+used, SBUF-used,
+            "%s{\"index\":%d,\"name\":\"%s\",\"host\":\"%s\",\"model\":\"%s\",\"mode\":%u,\"has_code\":%s}",
+            first ? "" : ",", i, name, host, model, camera.transport, camera.access_code[0] ? "true" : "false");
+        if (n < 0 || n >= SBUF-used-3) return ESP_FAIL;
+        used += n; first = false;
+    }
+    snprintf(s_buf+used, SBUF-used, "]}");
+    send_json(req, s_buf);
+    return ESP_OK;
+}
+
+static esp_err_t camera_save_handler(httpd_req_t *req) {
+    char body[512], index[8], host[64], code[34], model[100], mode[8], pair[4];
+    if (req->content_len >= sizeof(body) || read_body(req, body, sizeof(body)) < 0) return ESP_FAIL;
+    form_field(body, "idx", index, sizeof(index));
+    form_field(body, "host", host, sizeof(host));
+    form_field(body, "code", code, sizeof(code));
+    form_field(body, "model", model, sizeof(model));
+    form_field(body, "mode", mode, sizeof(mode));
+    form_field(body, "pair", pair, sizeof(pair));
+    if (strlen(index) != 1 || index[0] < '0' || index[0] >= '0'+CFG_MACHINE_MAX ||
+        strlen(mode) != 1 || mode[0] < '0' || mode[0] > '2') {
+        send_json(req, "{\"err\":\"Invalid printer or camera source\"}"); return ESP_OK;
+    }
+    for (const char *p = host; *p; p++) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '.' || *p == '-')) {
+            send_json(req, "{\"err\":\"Enter a printer IP or hostname, without a URL or port\"}"); return ESP_OK;
+        }
+    }
+    device_config_t devices;
+    config_load_printers(&devices);
+    const char *serial = devices.bambu_sn[index[0]-'0'];
+    if (!serial[0]) { send_json(req, "{\"err\":\"Configure the printer account first\"}"); return ESP_OK; }
+    camera_config_t camera;
+    camera_config_load(serial, &camera);
+    if (strcmp(host, camera.host) || (code[0] && strcmp(code, camera.access_code)) || pair[0] == '1')
+        memset(camera.certificate_sha256, 0, sizeof(camera.certificate_sha256));
+    strlcpy(camera.host, host, sizeof(camera.host));
+    utf8_copy(camera.model, sizeof(camera.model), model);
+    camera.transport = mode[0]-'0';
+    if (code[0]) {
+        if (strlen(code) != 8) { send_json(req, "{\"err\":\"LAN access code must have 8 characters\"}"); return ESP_OK; }
+        for (int i = 0; i < 8; i++) if ((unsigned char)code[i] < 33 || (unsigned char)code[i] > 126) {
+            send_json(req, "{\"err\":\"Invalid LAN access code\"}"); return ESP_OK;
+        }
+        strlcpy(camera.access_code, code, sizeof(camera.access_code));
+    }
+    if (host[0] && !camera.access_code[0]) { send_json(req, "{\"err\":\"Enter the printer LAN access code\"}"); return ESP_OK; }
+    if (!camera_config_save(serial, &camera)) { send_json(req, "{\"err\":\"Camera configuration could not be saved\"}"); return ESP_OK; }
+    send_json(req, "{\"ok\":1}");
+    schedule_restart(3000);
+    return ESP_OK;
+}
+
 static void start_web(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 8192;         // HTTP 表单 + TLS 握手(12KB 会挤占 TLS 堆内存)
-    config.max_uri_handlers = 13;     // 现有 12 个 URI(默认 8 会注册失败)
+    config.max_uri_handlers = 15;
     config.task_priority = 4;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -1009,6 +1101,8 @@ static void start_web(void)
     httpd_uri_t sendcode  = { .uri = "/sendcode",  .method = HTTP_POST, .handler = sendcode_handler,  .user_ctx = NULL };
     httpd_uri_t login     = { .uri = "/login",     .method = HTTP_POST, .handler = login_handler,     .user_ctx = NULL };
     httpd_uri_t nettest   = { .uri = "/nettest",   .method = HTTP_GET,  .handler = nettest_handler,   .user_ctx = NULL };
+    httpd_uri_t camera_get = { .uri = "/camera", .method = HTTP_GET, .handler = camera_get_handler };
+    httpd_uri_t camera_save = { .uri = "/camera", .method = HTTP_POST, .handler = camera_save_handler };
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &save);
     httpd_register_uri_handler(server, &scan);
@@ -1021,6 +1115,8 @@ static void start_web(void)
     httpd_register_uri_handler(server, &sendcode);
     httpd_register_uri_handler(server, &login);
     httpd_register_uri_handler(server, &nettest);
+    httpd_register_uri_handler(server, &camera_get);
+    httpd_register_uri_handler(server, &camera_save);
     ESP_LOGI(TAG, "HTTP server started :80");
 }
 

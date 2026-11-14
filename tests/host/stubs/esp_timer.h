@@ -10,3 +10,4 @@ typedef struct {
 int64_t esp_timer_get_time(void);
 esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *timer);
 esp_err_t esp_timer_start_periodic(esp_timer_handle_t timer, uint64_t period_us);
+esp_err_t esp_timer_stop(esp_timer_handle_t timer);

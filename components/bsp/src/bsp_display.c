@@ -25,7 +25,9 @@ static const gpio_num_t s_deep_sleep_pins[] = {
 };
 
 static const uint8_t s_deep_sleep_levels[] = {
-    1, 0, 0, 0, 0,
+    // CS is inactive, so MOSI may stay high. GPIO9 is also a C3 boot strap;
+    // retaining a high level keeps reset/recovery compatible with SPI boot.
+    1, 0, 1, 0, 0,
 };
 
 static esp_err_t display_set_safe_levels(void) {

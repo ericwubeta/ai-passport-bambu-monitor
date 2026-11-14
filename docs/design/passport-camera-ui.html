@@ -1,0 +1,244 @@
+<style>
+  #passport-camera-design { width:100%; }
+  #passport-camera-design .passport-preview-stage { display:flex; flex-direction:column; align-items:center; gap:20px; padding:24px 0; }
+  #passport-camera-design .passport-device { --passport-bg:#0B0F16; --passport-panel:#10151D; --passport-panel2:#141B25; --passport-line:#1E2A38; --passport-green:#00C853; --passport-green-light:#34D97B; --passport-orange:#FF6B35; --passport-cyan:#2EC4B6; --passport-text:#E6EDF3; --passport-dim:#6B7A8C; --passport-yellow:#F5A524; --passport-red:#E5484D; width:360px; max-width:100%; }
+  #passport-camera-design .passport-screen-ratio { position:relative; width:100%; aspect-ratio:3/4; }
+  #passport-camera-design .passport-screen { position:absolute; width:240px; height:320px; left:50%; top:0; transform-origin:top center; transform:translateX(-50%) scale(var(--passport-scale,1.5)); overflow:hidden; border-radius:30px; background:var(--passport-bg); color:var(--passport-text); font-family:Arial,"Microsoft YaHei",sans-serif; font-size:14px; font-weight:400; line-height:18px; box-shadow:0 0 0 1px var(--passport-line); }
+  #passport-camera-design .passport-screen * { box-sizing:border-box; }
+  #passport-camera-design .passport-screen [hidden] { display:none!important; }
+  #passport-camera-design .passport-header { position:absolute; inset:0 0 auto; height:32px; background:var(--passport-panel); border-bottom:2px solid var(--passport-line); }
+  #passport-camera-design .passport-clock { position:absolute; left:8px; top:6px; color:var(--passport-green-light); font-variant-numeric:tabular-nums; }
+  #passport-camera-design .passport-cloud { position:absolute; left:54px; top:12px; width:6px; height:6px; border-radius:50%; background:var(--passport-green); }
+  #passport-camera-design .passport-dots { position:absolute; left:88px; top:13px; display:flex; gap:5px; }
+  #passport-camera-design .passport-dots span { width:5px; height:5px; border-radius:50%; background:var(--passport-line); }
+  #passport-camera-design .passport-dots .current { background:var(--passport-green); }
+  #passport-camera-design .passport-charge { position:absolute; right:34px; top:6px; color:var(--passport-dim); }
+  #passport-camera-design .passport-battery { position:absolute; left:210px; top:9px; width:24px; height:13px; border:2px solid var(--passport-dim); border-radius:2px; }
+  #passport-camera-design .passport-battery::before { content:""; position:absolute; left:0; top:0; width:15px; height:9px; background:var(--passport-green); }
+  #passport-camera-design .passport-battery::after { content:""; position:absolute; left:24px; top:1px; width:3px; height:7px; background:var(--passport-dim); }
+  #passport-camera-design .passport-bolt { position:absolute; left:216px; top:9px; width:11px; height:13px; }
+  #passport-camera-design .passport-bolt::before, #passport-camera-design .passport-bolt::after { content:""; position:absolute; inset:0; background:var(--passport-text); }
+  #passport-camera-design .passport-bolt::before { clip-path:polygon(90% 0,0 58.3%,60% 58.3%); }
+  #passport-camera-design .passport-bolt::after { clip-path:polygon(40% 41.7%,100% 41.7%,10% 100%); }
+  #passport-camera-design .passport-statusbar { position:absolute; left:0; top:32px; width:240px; height:19px; padding:0 7px; background:var(--passport-panel); color:var(--passport-dim); border-bottom:1px solid var(--passport-line); overflow:hidden; white-space:nowrap; }
+  #passport-camera-design .passport-page { position:absolute; inset:52px 0 0; }
+  #passport-camera-design .camera-layer { position:absolute; right:12px; top:22px; color:var(--passport-cyan); font-variant-numeric:tabular-nums; }
+  #passport-camera-design .camera-job { position:absolute; left:12px; top:0; width:216px; color:var(--passport-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #passport-camera-design .camera-frame { position:absolute; left:0; top:40px; width:240px; height:135px; background:var(--passport-panel2); overflow:hidden; }
+  #passport-camera-design .camera-photo { display:block; width:240px; height:135px; object-fit:contain; }
+  #passport-camera-design .camera-placeholder { display:grid; place-items:center; width:100%; height:100%; color:var(--passport-dim); }
+  #passport-camera-design .camera-interruption { position:absolute; inset:0; display:flex; flex-direction:column; justify-content:center; align-items:center; gap:5px; background:rgba(11,15,22,.83); color:var(--passport-yellow); }
+  #passport-camera-design .camera-interruption small { font-size:14px; line-height:18px; color:var(--passport-text); }
+  #passport-camera-design .camera-age { position:absolute; left:12px; top:178px; display:flex; align-items:center; gap:6px; color:var(--passport-dim); }
+  #passport-camera-design .camera-age-dot { width:5px; height:5px; background:var(--passport-green); border-radius:50%; }
+  #passport-camera-design .camera-model { position:absolute; right:12px; top:178px; color:var(--passport-dim); }
+  #passport-camera-design .camera-print-state { position:absolute; left:12px; top:200px; color:var(--passport-green); }
+  #passport-camera-design .camera-percent { position:absolute; left:69px; top:196px; font-size:20px; line-height:25px; font-variant-numeric:tabular-nums; font-weight:500; }
+  #passport-camera-design .camera-remaining { position:absolute; right:12px; top:200px; font-variant-numeric:tabular-nums; }
+  #passport-camera-design .camera-track { position:absolute; left:12px; top:224px; width:216px; height:4px; background:var(--passport-line); border-radius:2px; overflow:hidden; }
+  #passport-camera-design .camera-fill { height:100%; width:68%; background:var(--passport-green); border-radius:2px; }
+  #passport-camera-design .camera-temperature { position:absolute; top:237px; width:104px; height:22px; display:flex; align-items:center; justify-content:space-between; padding:0 7px; border:1px solid var(--passport-line); border-radius:6px; background:var(--passport-panel2); }
+  #passport-camera-design .camera-nozzle { left:12px; }
+  #passport-camera-design .camera-bed { right:12px; }
+  #passport-camera-design .camera-temperature .caption { color:var(--passport-dim); }
+  #passport-camera-design .camera-nozzle .value { color:var(--passport-orange); }
+  #passport-camera-design .camera-bed .value { color:var(--passport-green-light); }
+  #passport-camera-design .progress-state { position:absolute; left:0; top:0; width:240px; text-align:center; color:var(--passport-green); font-size:20px; line-height:24px; }
+  #passport-camera-design .progress-job { position:absolute; left:10px; top:22px; width:220px; white-space:nowrap; text-align:center; overflow:hidden; color:var(--passport-dim); }
+  #passport-camera-design .progress-number { position:absolute; left:0; top:70px; display:flex; align-items:center; justify-content:center; width:240px; gap:6px; }
+  #passport-camera-design .pixel-digit { display:grid; grid-template-columns:repeat(4,7px); grid-template-rows:repeat(7,7px); margin-right:7px; }
+  #passport-camera-design .pixel-digit span { width:7px; height:7px; }
+  #passport-camera-design .pixel-digit .on { background:var(--passport-text); }
+  #passport-camera-design .progress-sign { font-size:20px; color:var(--passport-dim); }
+  #passport-camera-design .progress-track { position:absolute; left:20px; top:150px; width:200px; height:16px; border-radius:8px; background:var(--passport-panel2); border:1px solid var(--passport-line); padding:1px; }
+  #passport-camera-design .progress-track span { display:block; width:68%; height:12px; border-radius:6px; background:var(--passport-green); }
+  #passport-camera-design .progress-metrics { position:absolute; left:14px; top:188px; display:grid; grid-template-columns:104px 104px; gap:2px 4px; }
+  #passport-camera-design .progress-metric { display:flex; justify-content:space-between; align-items:center; padding:0 6px; height:20px; background:var(--passport-panel2); border:1px solid var(--passport-line); border-radius:6px; }
+  #passport-camera-design .progress-metric .caption { color:var(--passport-dim); }
+  #passport-camera-design .progress-remaining { position:absolute; top:232px; width:240px; text-align:center; color:var(--passport-green-light); font-size:20px; line-height:24px; }
+  #passport-camera-design .progress-hint { position:absolute; top:254px; width:240px; text-align:center; color:var(--passport-dim); }
+  #passport-camera-design .passport-buttons { display:flex; justify-content:center; gap:12px; }
+  #passport-camera-design .passport-buttons button { min-width:48px; min-height:44px; padding:7px 14px; background:var(--passport-panel); border:1px solid var(--passport-line); border-radius:8px; color:var(--passport-text); font:400 14px Arial,sans-serif; }
+  #passport-camera-design .preview-caption { margin:0; text-align:center; }
+  #passport-camera-design .preview-modes { justify-content:center; }
+  #passport-camera-design .preview-note { text-align:center; }
+  @media (prefers-reduced-motion:no-preference) {
+    #passport-camera-design .camera-fill { transition:width .2s; }
+  }
+</style>
+<div id="passport-camera-design">
+  <div class="viz-controls preview-modes" aria-label="预览状态">
+    <button type="button" class="btn is-selected" data-scenario="printing" aria-pressed="true">打印中</button>
+    <button type="button" class="btn" data-scenario="idle" aria-pressed="false">空闲</button>
+    <button type="button" class="btn" data-scenario="stale" aria-pressed="false">画面中断</button>
+  </div>
+  <div class="passport-preview-stage viz-dotted-background">
+    <div class="passport-device" aria-label="AI Passport 监控页设计">
+      <div class="passport-screen-ratio">
+        <div class="passport-screen" aria-label="240×320 屏幕，监控为第二页">
+          <div class="passport-header">
+            <span class="passport-clock">19:12</span><span class="passport-cloud" aria-label="云在线"></span>
+            <div class="passport-dots" aria-label="第二页，共六页"><span></span><span class="current"></span><span></span><span></span><span></span><span></span></div>
+            <span class="passport-charge">76%</span><span class="passport-battery" aria-hidden="true"></span><span class="passport-bolt" aria-label="USB connected"></span>
+          </div>
+          <div class="passport-statusbar">云在线 · Home Wi-Fi</div>
+          <section class="passport-page camera-page" aria-label="监控第二页">
+            <div class="camera-layer">178/260 层</div>
+            <div class="camera-job" data-tooltip="示例任务：spool-holder.gcode.3mf">spool-holder.gcode.3mf</div>
+            <div class="camera-frame">
+              <div class="camera-placeholder">相机画面 · 240 × 135</div>
+              <img class="camera-photo" alt="X2D 实测采集的打印机内部快照，非实时连接" hidden>
+              <div class="camera-interruption" hidden><span>画面连接中断</span><small>最后画面 · 18s 前</small></div>
+            </div>
+            <div class="camera-age" data-tooltip="原型示例；固件按成功显示间隔测量 FPS，五秒未更新显示 Loading..."><span class="camera-age-dot"></span><span class="camera-age-text">1.0 FPS</span></div>
+            <div class="camera-model">X2D</div>
+            <div class="camera-print-state">打印中</div><div class="camera-percent">68%</div><div class="camera-remaining">剩余 1h24m</div>
+            <div class="camera-track" role="progressbar" aria-label="打印进度" aria-valuenow="68" aria-valuemin="0" aria-valuemax="100"><div class="camera-fill"></div></div>
+            <div class="camera-temperature camera-nozzle"><span class="caption">喷嘴</span><span class="value">220°</span></div>
+            <div class="camera-temperature camera-bed"><span class="caption">热床</span><span class="value">60°</span></div>
+          </section>
+          <section class="passport-page progress-page" aria-label="原有进度第一页" hidden>
+            <div class="progress-state">打印中</div><div class="progress-job">spool-holder.gcode.3mf</div>
+            <div class="progress-number" aria-label="68%"><div class="pixel-digits" style="display:flex"></div><span class="progress-sign">%</span></div>
+            <div class="progress-track"><span></span></div>
+            <div class="progress-metrics">
+              <div class="progress-metric"><span class="caption">喷嘴</span><span style="color:var(--passport-orange)">220/220</span></div>
+              <div class="progress-metric"><span class="caption">热床</span><span style="color:var(--passport-green-light)">60/60</span></div>
+              <div class="progress-metric"><span class="caption">层</span><span style="color:var(--passport-cyan)">178/260</span></div>
+              <div class="progress-metric"><span class="caption">风扇</span><span style="color:var(--passport-dim)">80%</span></div>
+            </div>
+            <div class="progress-remaining">剩余 1h24m</div><div class="progress-hint">OK 切换完成时刻</div>
+          </section>
+        </div>
+      </div>
+    </div>
+    <div class="passport-device">
+      <div class="passport-buttons" aria-label="模拟实体按键">
+        <button type="button" data-key="up" class="cursor-interaction" aria-label="上一页：查看原进度页">↑</button>
+        <button type="button" data-key="ok" class="cursor-interaction" aria-label="OK：监控页手动更新画面">OK</button>
+        <button type="button" data-key="down" class="cursor-interaction" aria-label="下一页：查看监控第二页">↓</button>
+      </div>
+    </div>
+    <p class="preview-caption text-small text-muted" aria-live="polite">第二页 · 监控</p>
+  </div>
+  <div class="preview-note text-small text-muted">静态布局预览 · 示例打印信息</div>
+  <script type="application/json" id="passport-camera-sample">{"image":""}</script>
+</div>
+<script>
+(() => {
+  const root = document.getElementById('passport-camera-design');
+  const device = root.querySelector('.passport-device');
+  const screen = root.querySelector('.passport-screen');
+  const cameraPage = root.querySelector('.camera-page');
+  const progressPage = root.querySelector('.progress-page');
+  const caption = root.querySelector('.preview-caption');
+  const q = selector => root.querySelector(selector);
+  const options = { showLayer:true, showTemperature:true };
+  let scenario = 'printing';
+  let page = 1;
+  let showEta = false;
+  const saved = window.openai?.widgetState;
+  const model = saved?.modelContent || saved || {};
+  if (['printing','idle','stale'].includes(model.scenario)) scenario = model.scenario;
+  if ([0,1].includes(model.page)) page = model.page;
+  if (typeof saved?.privateContent?.showLayer === 'boolean') options.showLayer = saved.privateContent.showLayer;
+  if (typeof saved?.privateContent?.showTemperature === 'boolean') options.showTemperature = saved.privateContent.showTemperature;
+
+  const sample = JSON.parse(document.getElementById('passport-camera-sample').textContent);
+  if (sample.image) {
+    const photo = q('.camera-photo');
+    photo.src = sample.image;
+    photo.hidden = false;
+    q('.camera-placeholder').hidden = true;
+  }
+  const patterns = [[6,9,9,9,9,9,6],[2,6,2,2,2,2,7],[6,9,1,2,4,8,15],[14,1,2,6,2,1,14],[2,6,10,9,15,2,2],[15,8,14,1,1,9,6],[6,8,14,9,9,9,6],[15,1,2,4,4,4,4],[6,9,9,6,9,9,6],[6,9,9,7,1,1,6]];
+  function drawDigits(text) {
+    const container = q('.pixel-digits');
+    container.replaceChildren();
+    for (const character of text) {
+      const digit = document.createElement('span'); digit.className = 'pixel-digit';
+      for (const row of patterns[Number(character)]) for (let bit=3;bit>=0;bit--) {
+        const pixel = document.createElement('span'); if (row & (1 << bit)) pixel.className = 'on'; digit.appendChild(pixel);
+      }
+      container.appendChild(digit);
+    }
+    q('.progress-number').setAttribute('aria-label', `${text}%`);
+  }
+  function save() {
+    const promise = window.openai?.setWidgetState?.({modelContent:{scenario,page},privateContent:{showLayer:options.showLayer,showTemperature:options.showTemperature}});
+    promise?.catch?.(() => {});
+  }
+  function render() {
+    const idle = scenario === 'idle';
+    const stale = scenario === 'stale';
+    const pct = idle ? 0 : 68;
+    const color = idle ? 'var(--passport-dim)' : 'var(--passport-green)';
+    const status = idle ? '空闲' : '打印中';
+    cameraPage.hidden = page !== 1;
+    progressPage.hidden = page !== 0;
+    caption.textContent = page === 1 ? '第二页 · 监控' : '第一页 · 原进度页';
+    root.querySelectorAll('.passport-dots span').forEach((dot,index) => dot.classList.toggle('current',index===page));
+    q('.passport-dots').setAttribute('aria-label',`第${page+1}页，共六页`);
+    q('.camera-job').textContent = idle ? '等待任务' : 'spool-holder.gcode.3mf';
+    q('.camera-layer').textContent = idle ? '--/-- 层' : '178/260 层';
+    q('.camera-layer').hidden = !options.showLayer;
+    q('.camera-print-state').textContent = status;
+    q('.camera-print-state').style.color = color;
+    q('.camera-percent').textContent = idle ? '--' : `${pct}%`;
+    q('.camera-remaining').textContent = idle ? '等待任务' : '剩余 1h24m';
+    q('.camera-fill').style.width = `${pct}%`;
+    q('.camera-fill').style.background = color;
+    q('.camera-track').setAttribute('aria-valuenow',String(pct));
+    q('.camera-nozzle .value').textContent = idle ? '28°' : '220°';
+    q('.camera-bed .value').textContent = idle ? '27°' : '60°';
+    root.querySelectorAll('.camera-temperature').forEach(el => el.hidden = !options.showTemperature);
+    q('.camera-interruption').hidden = !stale;
+    q('.camera-age-text').textContent = stale ? 'Loading...' : '1.0 FPS';
+    q('.camera-age-text').style.color = stale ? 'var(--passport-yellow)' : 'var(--passport-dim)';
+    q('.camera-age-dot').style.background = stale ? 'var(--passport-yellow)' : 'var(--passport-green)';
+    q('.progress-state').textContent = status;
+    q('.progress-state').style.color = color;
+    q('.progress-job').textContent = idle ? '等待任务' : 'spool-holder.gcode.3mf';
+    q('.progress-track span').style.width = `${pct}%`;
+    q('.progress-remaining').textContent = idle ? '--' : showEta ? '20:36 完成' : '剩余 1h24m';
+    q('.progress-hint').textContent = showEta ? 'OK 切换剩余时间' : 'OK 切换完成时刻';
+    const metricValues = idle ? ['28/0','27/0','--/--','0%'] : ['220/220','60/60','178/260','80%'];
+    root.querySelectorAll('.progress-metric').forEach((metric,index) => metric.lastElementChild.textContent = metricValues[index]);
+    drawDigits(String(pct));
+    root.querySelectorAll('[data-scenario]').forEach(button => {
+      const active = button.dataset.scenario === scenario;
+      button.classList.toggle('is-selected',active);button.setAttribute('aria-pressed',String(active));
+    });
+  }
+  function resize() { screen.style.setProperty('--passport-scale',String(device.getBoundingClientRect().width/240)); }
+  root.querySelectorAll('[data-scenario]').forEach(button => button.addEventListener('click',() => {
+    scenario = button.dataset.scenario; render(); save();
+  }));
+  root.querySelectorAll('[data-key]').forEach(button => button.addEventListener('click',() => {
+    const key = button.dataset.key;
+    if (key === 'up') page=0;
+    if (key === 'down') page=1;
+    if (key === 'ok') {
+      if (page===1) { scenario = scenario === 'stale' ? 'printing' : scenario; }
+      else showEta=!showEta;
+    }
+    render(); save();
+  }));
+  window.addEventListener('openai:set_globals',event => {
+    const state = event.detail?.globals?.widgetState;
+    const incoming = state?.modelContent || state || {};
+    if (['printing','idle','stale'].includes(incoming.scenario)) scenario=incoming.scenario;
+    if ([0,1].includes(incoming.page)) page=incoming.page;
+    if (typeof state?.privateContent?.showLayer === 'boolean') options.showLayer=state.privateContent.showLayer;
+    if (typeof state?.privateContent?.showTemperature === 'boolean') options.showTemperature=state.privateContent.showTemperature;
+    render();
+  });
+  if (globalThis.Tweak) {
+    const tweak = new Tweak({container:device,onChange:() => {render();save();}});
+    tweak.addToggle(options,'showLayer',{label:'显示层数'});
+    tweak.addToggle(options,'showTemperature',{label:'显示喷嘴与热床温度'});
+  }
+  new ResizeObserver(resize).observe(device);
+  render(); resize();
+})();
+</script>

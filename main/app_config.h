@@ -5,6 +5,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define CFG_NVS_NS "aipass"          // NVS 命名空间
 #define CFG_MACHINE_MAX 4            // 同账号最多 4 台打印机
@@ -24,6 +25,10 @@ typedef struct {
 // 兼容旧数据:老版本 bambu_sn 单键迁移到槽 0。
 bool config_load(device_config_t *cfg);
 
+// Read the effective printer roster: NVS first, then the legacy compiled serial
+// only when every NVS printer slot is empty. Does not write or migrate NVS.
+bool config_load_printers(device_config_t *cfg);
+
 // 写回完整配置(配网成功后调用)。返回是否全部写入成功。
 bool config_save(const device_config_t *cfg);
 
@@ -38,3 +43,15 @@ bool config_is_provisioned(void);
 
 // 标记配网完成。
 void config_mark_provisioned(void);
+
+// Last printer view, stored separately from account/network configuration.
+// slot is the stable physical page type, not its changing navigation index.
+typedef struct {
+    uint8_t version;
+    uint8_t slot;
+    uint8_t overview;
+    char serial[34];
+} printer_view_config_t;
+
+bool config_printer_view_load(printer_view_config_t *view);
+bool config_printer_view_save(const printer_view_config_t *view);

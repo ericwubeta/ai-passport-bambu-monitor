@@ -2,7 +2,7 @@
 // 裁剪自多合一固件:仅保留打印机监控,长按确定回单页菜单。
 //
 // 按键语义(与主固件一致):
-//   上/下 短按   打印机页=切换只读页面(状态/温度/AMS/设备)
+//   上/下 短按   打印机页=切换只读页面(进度/相机/温度/AMS/设备)
 //   确定  短按   打印机页=立即刷新
 //   确定  长按   返回菜单(单页,再按确定回到打印机页)
 #include "bsp_i2c.h"
@@ -20,20 +20,26 @@
 #include "app_printer.h"
 #include "app_wifi.h"
 #include "app_mqtt.h"
+#include "app_camera.h"
+#include "app_screen_policy.h"
+#include "app_poweroff.h"
 #include "font_zh.h"
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_pm.h"
+#include "esp_sleep.h"
 #include "driver/usb_serial_jtag.h"
 
 static const char *TAG = "main";
 
 // 空闲熄屏:30s 无按键 → 背光 0 并暂停 LVGL;任意键点亮,并吞掉唤醒它的那一次按键。
-static int64_t s_key_us;
+static screen_wake_state_t s_wake_policy;
+static screen_idle_state_t s_idle_policy;
 static bool    s_screen_off;
 static bool    s_swallow_key;
+static bool    s_swallow_released;
 static esp_timer_handle_t s_scr_timer;
 
 #if CONFIG_PM_ENABLE
@@ -51,6 +57,7 @@ static esp_pm_lock_handle_t s_awake_lock;
 static void usb_guard_cb(void *arg)
 {
     (void)arg;
+    if (app_poweroff_committed()) return;
     if (usb_serial_jtag_is_connected()) return;      // 还连着 USB,继续禁止 light sleep
     if (s_usb_lock) esp_pm_lock_release(s_usb_lock); // 已断线:放锁,自动 light sleep 生效
     if (s_usb_timer) esp_timer_stop(s_usb_timer);    // 断线后没必要再复查
@@ -84,26 +91,68 @@ static void pm_init(void)
 }
 #endif
 
+static bool screen_wake(void)
+{
+    if (!app_poweroff_activity()) return false;
+    if (!s_screen_off) return true;
+    if (!bsp_lvgl_lock(200)) return false;
+#if CONFIG_PM_ENABLE
+    if (s_awake_lock) esp_pm_lock_acquire(s_awake_lock);
+#endif
+    // Resume rendering before lighting the panel, as with a key wake.
+    app_printer_set_suspended(false);
+    bsp_lvgl_set_suspended(false);
+    bsp_display_backlight(100);
+    s_screen_off = false;
+    bsp_lvgl_unlock();
+    return true;
+}
+
 static void screen_off_tick(void *arg)
 {
     (void)arg;
-    if (s_screen_off || app_provision_needed()) return;   // 配网页不熄屏
-    if (esp_timer_get_time() - s_key_us < 30LL * 1000 * 1000) return;
+    if (app_poweroff_committed()) return;
+    bool usb_connected = bsp_battery_usb_connected();
+    if (usb_connected != s_wake_policy.usb_connected) {
+        ESP_LOGI(TAG, "USB host power=%d, screen_off=%d", usb_connected, s_screen_off);
+    }
+    bool sleep_due = screen_idle_poll(&s_idle_policy, usb_connected,
+                                      app_mqtt_any_printing(), esp_timer_get_time());
+    bool wake_pending = screen_wake_poll(&s_wake_policy, usb_connected, app_mqtt_screen_wake_sequence());
+    app_poweroff_poll(s_screen_off, wake_pending);
+    if (wake_pending) {
+        // Wake wins over a simultaneous timeout. Keep the request pending if
+        // the LVGL lock is busy, and start its 30 seconds only after success.
+        if (screen_wake()) {
+            screen_wake_ack(&s_wake_policy);
+            screen_idle_activity(&s_idle_policy, esp_timer_get_time());
+            ESP_LOGI(TAG, "Screen wake event handled");
+        }
+        return;
+    }
+    if (s_screen_off || !sleep_due) return;
+    if (!bsp_lvgl_lock(200)) return;
+    app_printer_set_suspended(true);
     bsp_display_backlight(0);
     // 熄屏后停掉 LVGL 的 5ms tick 与全部 lv_timer,CPU 才有连续空闲进入 light sleep。
     bsp_lvgl_set_suspended(true);
 #if CONFIG_PM_ENABLE
     if (s_awake_lock) esp_pm_lock_release(s_awake_lock);   // 画面已冻结,允许入睡
 #endif
-    // 已确认熄屏,不再需要每秒检查;下次按键唤醒时重启。
-    if (s_scr_timer) esp_timer_stop(s_scr_timer);
+    // Network and event checks keep running while the display is suspended.
     s_screen_off = true;
+    app_poweroff_poll(true, false);
+    bsp_lvgl_unlock();
     ESP_LOGI(TAG, "空闲 30s,熄屏");
 }
 
 static void screen_off_init(void)
 {
-    s_key_us = esp_timer_get_time();
+    screen_idle_init(&s_idle_policy, esp_timer_get_time());
+    s_wake_policy = (screen_wake_state_t){
+        .usb_connected = bsp_battery_usb_connected(),
+        .print_sequence = app_mqtt_screen_wake_sequence(),
+    };
     const esp_timer_create_args_t a = {
         .name = "scr_off", .callback = screen_off_tick, .arg = NULL,
     };
@@ -114,22 +163,33 @@ static void screen_off_init(void)
 // true = 这次按键只用于唤醒,不再往下处理。
 static bool screen_off_on_key(bsp_btn_ev_t ev)
 {
-    s_key_us = esp_timer_get_time();
+    if (!app_poweroff_activity()) return true;
+    screen_idle_activity(&s_idle_policy, esp_timer_get_time());
     if (s_screen_off) {
-        s_screen_off = false;
-#if CONFIG_PM_ENABLE
-        if (s_awake_lock) esp_pm_lock_acquire(s_awake_lock);   // 先禁止入睡,再恢复刷新
-#endif
-        // 先恢复 LVGL(tick + 定时器,并整屏失效),再开背光,避免亮起一帧陈旧画面。
-        bsp_lvgl_set_suspended(false);
-        bsp_display_backlight(100);
-        if (s_scr_timer) esp_timer_start_periodic(s_scr_timer, 1000ULL * 1000);
-        ESP_LOGI(TAG, "按键唤醒,亮屏");
-        if (ev != BSP_BTN_RELEASE) s_swallow_key = true;
+        screen_wake_request(&s_wake_policy);
+        // Consume the entire wake gesture even if rendering resumes later
+        // through the pending-request retry rather than this callback.
+        if (ev != BSP_BTN_RELEASE) {
+            s_swallow_key = true;
+            s_swallow_released = false;
+        }
+        if (screen_wake()) {
+            screen_wake_ack(&s_wake_policy);
+            screen_idle_activity(&s_idle_policy, esp_timer_get_time());
+            ESP_LOGI(TAG, "按键唤醒,亮屏");
+        }
         return true;
     }
     if (s_swallow_key) {
-        if (ev == BSP_BTN_RELEASE) s_swallow_key = false;
+        // SINGLE_CLICK follows RELEASE after the button's click timeout.
+        // Swallow that delayed action too, so waking does not change pages.
+        if (ev == BSP_BTN_CLICK || ev == BSP_BTN_DOUBLE) s_swallow_key = false;
+        else if (ev == BSP_BTN_RELEASE) s_swallow_released = true;
+        else if (ev == BSP_BTN_PRESS && s_swallow_released) {
+            s_swallow_key = false;
+            s_swallow_released = false;
+            return false;
+        }
         return true;
     }
     return false;
@@ -235,10 +295,29 @@ static void boot_done(void) {
     app_mqtt_start();
     s_active = 0;
     DEMOS[0].enter();
+#if CONFIG_CAMERA_START_ON_SECOND_PAGE || defined(CAMERA_DIAGNOSTIC_START)
+    if (app_mqtt_machine_count() == 1) app_printer_key(BSP_BTN_DOWN, BSP_BTN_CLICK);
+#endif
+}
+
+static void boot_key_gesture(bool deep_wake, int mv) {
+    s_swallow_released = mv >= BSP_BTN_MV_RELEASED_MIN;
+    s_swallow_key = deep_wake || !s_swallow_released;
 }
 
 void app_main(void) {
+#ifdef NOTIFY_TRANSITION_SELFTEST
+    extern void notify_transition_selftest(void);
+    notify_transition_selftest();
+#endif
+#if CONFIG_CAMERA_GEOMETRY_SELFTEST
+    extern void camera_geometry_selftest(void);
+    camera_geometry_selftest();
+#endif
     ESP_LOGI(TAG, APP_PRODUCT_NAME " starting on " APP_HARDWARE_NAME);
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    ESP_LOGI(TAG, "Boot wake=%s", wake_cause == ESP_SLEEP_WAKEUP_GPIO ? "button" :
+             wake_cause == ESP_SLEEP_WAKEUP_TIMER ? "timer" : "reset");
 
     bsp_i2c_init();
     bsp_i2c_scan();
@@ -253,7 +332,9 @@ void app_main(void) {
     bsp_display_backlight(100);
     screen_off_init();
 
+    s_swallow_key = true;
     s_ok[0] = (bsp_button_init(on_key, NULL) == ESP_OK);   // 页面导航依赖按键
+    if (s_ok[0]) boot_key_gesture(wake_cause == ESP_SLEEP_WAKEUP_GPIO, bsp_button_read_mv());
     s_ok[1] = true;                                        // 配网页常驻可用(修:原来进不去)
     s_ok[2] = true;                                        // 切网页:依赖已保存 WiFi 列表
     bsp_audio_init();                                       // 提示音(完成/失败/HMS)

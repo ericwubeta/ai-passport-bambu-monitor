@@ -3,6 +3,7 @@
 #include "bsp_battery.h"
 #include "bsp_i2c.h"
 #include "bsp_pins.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -225,4 +226,8 @@ int bsp_battery_mv(void) {
     if (cw_read(CW_REG_VCELL_H, b, 2) != 0) return -1;
     uint32_t raw = ((uint32_t)b[0] << 8 | b[1]) & 0x3FFF;   // 14bit
     return (int)((raw * 3125) / 10000);                     // raw * 312.5uV → mV
+}
+
+bool bsp_battery_usb_connected(void) {
+    return usb_serial_jtag_is_connected();
 }

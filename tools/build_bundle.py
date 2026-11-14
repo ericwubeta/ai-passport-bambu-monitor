@@ -5,8 +5,8 @@ import argparse,hashlib,importlib.util,json,re,shutil,zipfile
 def main():
     root=Path(__file__).resolve().parents[1]
     p=argparse.ArgumentParser();p.add_argument('--build',type=Path,default=root/'build');p.add_argument('--output',type=Path,default=root/'dist');a=p.parse_args()
-    product=re.search(r'#define APP_PRODUCT_LINE "(Core|Spirit)"',(root/'main/app_identity.h').read_text())[1]
-    version=re.search(r'project\(passport_printer VERSION ([\d.]+)\)',(root/'CMakeLists.txt').read_text())[1]
+    product=re.search(r'#define APP_PRODUCT_LINE "(Core|Spirit)"',(root/'main/app_identity.h').read_text(encoding="utf-8"))[1]
+    version=re.search(r'project\(passport_printer VERSION ([\d.]+)\)',(root/'CMakeLists.txt').read_text(encoding="utf-8"))[1]
     dest=a.output/f'PrintPet-{product}-{version}';dest.mkdir(parents=True,exist_ok=False);(dest/'images').mkdir()
     spec=importlib.util.spec_from_file_location('guard',root/'tools/installer/printpet_flash.py');guard=importlib.util.module_from_spec(spec);spec.loader.exec_module(guard)
     sha=lambda q:hashlib.sha256(q.read_bytes()).hexdigest()

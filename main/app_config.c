@@ -1,5 +1,6 @@
 // main/app_config.c —— NVS 配置读写实现(见 app_config.h)。
 #include "app_config.h"
+#include "app_secrets.h"
 
 #include <string.h>
 
@@ -73,6 +74,16 @@ bool config_load(device_config_t *cfg) {
     return true;
 }
 
+bool config_load_printers(device_config_t *cfg) {
+    if (!cfg) return false;
+    bool loaded = config_load(cfg);
+    if (config_machine_count(cfg) == 0 && CFG_BAMBU_SERIAL[0] &&
+        strcmp(CFG_BAMBU_SERIAL, "00C00AAAA000000")) {
+        strlcpy(cfg->bambu_sn[0], CFG_BAMBU_SERIAL, sizeof(cfg->bambu_sn[0]));
+    }
+    return loaded;
+}
+
 bool config_save(const device_config_t *cfg) {
     if (!cfg || ensure_open() != ESP_OK) return false;
     bool ok = true;
@@ -130,4 +141,41 @@ void config_mark_provisioned(void) {
     if (ensure_open() != ESP_OK) return;
     nvs_set_u8(s_handle, "configured", 1);
     nvs_commit(s_handle);
+}
+
+static bool printer_view_valid(const printer_view_config_t *view) {
+    return view && view->version == 1 && view->slot <= 8 && view->overview <= 1 &&
+           view->serial[0] && memchr(view->serial, 0, sizeof(view->serial));
+}
+
+bool config_printer_view_load(printer_view_config_t *view) {
+    if (!view) return false;
+    memset(view, 0, sizeof(*view));
+    // A UI preference must never trigger NVS erasure or rewrite credentials.
+    if (nvs_flash_init() != ESP_OK) return false;
+    nvs_handle_t handle;
+    if (nvs_open("printer_ui", NVS_READONLY, &handle) != ESP_OK) return false;
+    size_t size = sizeof(*view);
+    esp_err_t err = nvs_get_blob(handle, "view", view, &size);
+    nvs_close(handle);
+    return err == ESP_OK && size == sizeof(*view) && printer_view_valid(view);
+}
+
+bool config_printer_view_save(const printer_view_config_t *view) {
+    if (!printer_view_valid(view)) return false;
+    printer_view_config_t previous;
+    if (config_printer_view_load(&previous) && previous.slot == view->slot &&
+        previous.overview == view->overview && !strcmp(previous.serial, view->serial)) return true;
+    if (nvs_flash_init() != ESP_OK) return false;
+    nvs_handle_t handle;
+    if (nvs_open("printer_ui", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t err = nvs_set_blob(handle, "view", view, sizeof(*view));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Saving printer view failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(TAG, "Saved printer view slot=%u overview=%u", view->slot, view->overview);
+    return true;
 }

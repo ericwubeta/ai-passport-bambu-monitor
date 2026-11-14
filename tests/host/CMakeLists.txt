@@ -11,7 +11,8 @@ set(CORE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 # even when a developer has a private main/secrets.h in their local checkout.
 configure_file("${CORE_ROOT}/main/app_mqtt.c" "${CMAKE_CURRENT_BINARY_DIR}/app_mqtt_under_test.c" COPYONLY)
 add_executable(test_mqtt_readonly test_mqtt_readonly.c
-    "${CMAKE_CURRENT_BINARY_DIR}/app_mqtt_under_test.c" "${CJSON_DIR}/cJSON.c")
+    "${CMAKE_CURRENT_BINARY_DIR}/app_mqtt_under_test.c" "${CJSON_DIR}/cJSON.c"
+    "${CORE_ROOT}/main/app_notify_transition.c" "${CORE_ROOT}/main/app_screen_policy.c")
 target_include_directories(test_mqtt_readonly PRIVATE stubs "${CORE_ROOT}/main" "${CJSON_DIR}")
 if(MSVC)
     target_compile_options(test_mqtt_readonly PRIVATE /utf-8 /UNDEBUG "/FI${CMAKE_CURRENT_LIST_DIR}/stubs/compat.h")
@@ -33,9 +34,9 @@ if(PRINTPET_UI_TESTS)
     set(CONFIG_LV_USE_THORVG_INTERNAL OFF CACHE BOOL "" FORCE)
     add_subdirectory("${LVGL_DIR}" lvgl)
     add_executable(test_ui_readonly test_ui_readonly.c "${CORE_ROOT}/main/app_printer.c"
-        "${CORE_ROOT}/main/hms_codes.c" "${CORE_ROOT}/main/font_zh14.c" "${CORE_ROOT}/main/font_zh20.c")
+        "${CORE_ROOT}/main/camera_rate.c" "${CORE_ROOT}/main/hms_codes.c" "${CORE_ROOT}/main/font_zh14.c" "${CORE_ROOT}/main/font_zh20.c")
     target_include_directories(test_ui_readonly PRIVATE stubs "${CORE_ROOT}/main" "${CORE_ROOT}/components/bsp/include")
-    target_compile_definitions(test_ui_readonly PRIVATE FW_VERSION="1.5.1-host")
+    target_compile_definitions(test_ui_readonly PRIVATE FW_VERSION="1.5.2-host" CONFIG_CAMERA_STALE_MS=5000)
     if(MSVC)
         target_compile_options(test_ui_readonly PRIVATE /utf-8 /UNDEBUG "/FI${CMAKE_CURRENT_LIST_DIR}/stubs/compat.h")
         target_compile_definitions(test_ui_readonly PRIVATE _CRT_SECURE_NO_WARNINGS)

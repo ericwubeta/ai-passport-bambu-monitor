@@ -40,3 +40,4 @@ esp_err_t esp_mqtt_client_start(esp_mqtt_client_handle_t client);
 int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t client, const char *topic, int qos);
 int esp_mqtt_client_publish(esp_mqtt_client_handle_t client, const char *topic, const char *data,
                             int length, int qos, int retain);
+esp_err_t esp_mqtt_client_stop(esp_mqtt_client_handle_t client);
