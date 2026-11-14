@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "nozzle_schema_decode.h"
 
 #define BAMBU_AMS_MAX   4          // 最多同时挂载的 AMS 台数
 #define BAMBU_TRAY_MAX  4          // 每台 AMS 4 个料槽
@@ -27,10 +28,15 @@ typedef struct {
     int       tray_remain;     // 剩余克数 = tray_weight * tray_pct / 100
     bool      is_used;         // 槽内有料(用于 2D 封面料斗 / 空槽置灰)
     bool      active;          // 当前打印正在使用的槽
+    bool      reported;
+    bool      pct_valid;
+    uint64_t  updated_ms, pct_updated_ms;
 } bambu_tray_t;
 
 typedef struct {
     bool present;              // 该 AMS 在位
+    uint8_t id;                // Explicit protocol ID; array order can change.
+    uint64_t humidity_updated_ms, humidity_raw_updated_ms, temp_updated_ms;
     int  humidity;             // 干燥档 1..4(非百分比),-1=未知
     int  humidity_raw;         // 湿度百分比(X2D/AMS2 报 humidity_raw,如 42)
     int  temp;                 // 料仓温度 ℃
@@ -45,13 +51,27 @@ typedef struct {
     bambu_cloud_t cloud;
 
     char  gcode_state[10];   // IDLE/RUNNING/PAUSE/FAILED/FINISH
+    bool state_received;     // gcode_state received during this MQTT connection
+    uint64_t state_updated_ms; // monotonic receipt time, not wall-clock/SNTP
+    uint32_t print_error;    // 32-bit print error; independent of truncated HMS display codes
+    uint32_t job_generation; // background job identity; survives leaving the printer UI
+    char task_id[32];        // subtask_id when supplied by the printer (not a display name)
     int   pct;               // mc_percent 0-100
+    bool pct_valid, remain_valid;
+    uint64_t pct_ms, remain_ms;
     int   remain_min;        // mc_remaining_time(分钟)
     int   layer, total_layer;
 
     int   nozzle_t, nozzle_target;
+    bool nozzle_valid, nozzle_target_valid, bed_valid, bed_target_valid, chamber_valid;
+    uint64_t nozzle_ms, nozzle_target_ms, bed_ms, bed_target_ms, chamber_ms;
+    nozzle_head_table_t heads;
+    nozzle_state_bits_t extruder;
+    bool structured_heads;
+    uint64_t ams_updated_ms;
     int   bed_t, bed_target;
     int   chamber_t;
+    char model[20];             // Actual reported/configured model only.
     int   fan_cooling_pct;   // cooling_fan_speed 0-15 档 → 百分比近似
     int   spd_lvl;           // 1 静音 2 标准 3 运动 4 疯狂
     int   wifi_signal;       // 打印机侧 dBm
@@ -60,6 +80,7 @@ typedef struct {
     int   printer_ip;        // net.info[0].ip 原始整数(小端拼接)
 
     bambu_ams_t ams[BAMBU_AMS_MAX];
+    bambu_tray_t external_tray;
     int   ams_count;         // 在位 AMS 台数(0=外部料筒或未知)
     bool  ams_active;        // true=AMS 当前料槽;false=外部料筒
     bambu_hms_t hms[BAMBU_HMS_MAX];

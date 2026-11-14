@@ -1,9 +1,8 @@
 // main/app_printer.c —— 打印机状态主界面。
-// 页面(动态):0 进度(环形进度圈+大%) 1 温度
-//           2..2+AMS台数 AMS 料槽页(每台一页,2x2 槽) 设备(含 HMS)。只读监控。
+// 页面(动态):0 精灵首页(状态动作+大%+进度条) 1 温度
+//           2..2+AMS台数 AMS 料槽页(每台一页,2x2 槽) 设备(含 HMS)。
 // 数据源:app_mqtt 快照 + bsp_battery;1 秒定时刷新,OK 键上下文操作。
 #include "app_printer.h"
-#include "app_identity.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -12,16 +11,30 @@
 
 #include "app_mqtt.h"
 #include "app_notify.h"
+#include "app_spirit_view.h"
+#include "app_spirit_skins.h"
+#include "app_telemetry.h"
+#include "spirit_dispatch.h"
+#include "spirit_bindings.h"
+#include "spirit_event_logic.h"
 #include "app_wifi.h"
 #include "bsp_battery.h"
 #include "font_zh.h"
 #include "hms_codes.h"
 #include "lvgl.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 
-#define PAGE_MAX 7          // 最多 2(固定)+4(AMS)+1(设备)
+#define PAGE_MAX 10          // Progress +4 temperature pairs +4 AMS + device.
 #define MSG_MAX  48
+#ifndef CHATTER_PERIOD_MS
+#define CHATTER_PERIOD_MS 180000ULL   // Text-only low-frequency bubble interval.
+#endif
+#ifndef CHATTER_FIRST_MS
+#define CHATTER_FIRST_MS 20000ULL     // First ambient line after entering the page.
+#endif
+#define BUBBLE_MS 6000ULL
 
 // 版面几何:上方 32..50 是常驻状态条(告警/云摘要),页面区从 52 起到屏底。
 // 状态条常驻而非"有告警才弹出",这样告警出现时不会盖住页面内容、布局也不跳变。
@@ -55,15 +68,16 @@ static bool s_ov_mode;      // true = 停留在机器列表(未进入详情)
 static int  s_ov_sel;       // 列表选中项
 static lv_obj_t *s_ov_page;
 static lv_obj_t *s_ov_card[BAMBU_MACHINE_MAX];
-static lv_obj_t *s_ov_dot[BAMBU_MACHINE_MAX];
+
 static lv_obj_t *s_ov_name[BAMBU_MACHINE_MAX];
 static lv_obj_t *s_ov_pct[BAMBU_MACHINE_MAX];
-static lv_obj_t *s_ov_bar[BAMBU_MACHINE_MAX];
-static lv_obj_t *s_ov_state[BAMBU_MACHINE_MAX];
-static int s_ov_bar_w;
+
+
+
 static int s_slot[PAGE_MAX];   // 导航序号 → 实体页槽位(实体固定:0进度 1温度 2~5AMS 6设备)
 static lv_timer_t *s_timer;
 static lv_timer_t *s_fast;     // 30ms 快速重绘:承接按键回调里延后的重绘请求
+static lv_timer_t *s_retry;    // 单个延后刷新,页面销毁前取消
 static bool s_need_refresh;    // 按键触发的重绘请求(放到 LVGL 任务里执行)
 static bsp_btn_t   s_pk_btn;   // 挂起的按键(按钮回调只记录,不干活)
 static bsp_btn_ev_t s_pk_ev;
@@ -77,46 +91,221 @@ static lv_obj_t *s_dots[PAGE_MAX];
 static lv_obj_t *s_bar, *s_bar_lbl;
 
 // 进度页
-static lv_obj_t *s_status, *s_job, *s_pct_box, *s_pct_sign;
+static lv_obj_t *s_status, *s_job, *s_primary;
 static lv_obj_t *s_prog_track, *s_prog_fill;   // 横向进度条(替代折线圆环)
 static lv_obj_t *s_time_lbl, *s_time_hint;
-// 温度/层/风扇 chip(进度页下方 2x2)
-static lv_obj_t *s_c_noz_v, *s_c_bed_v, *s_c_layer_v, *s_c_fan_v;
+static lv_obj_t *s_bubble, *s_bubble_lbl;      // 状态语音/低频文字气泡
+static uint64_t s_bubble_until_ms;
+static uint64_t s_chatter_ms;
+static bool s_chatter_seen;
+static bool s_bubble_sticky;     // event bubble survives page switches; chatter does not
+static int s_hint_slot = -1;     // last page that already delivered its dialogue
+static int s_hint_variant[3] = { -1, -1, -1 };  // last alternate used per page
+static uint64_t s_last_refresh_ms;
 static bool s_show_eta;      // false=显示剩余;true=显示完成时刻
 // 温度页
-static lv_obj_t *s_noz_cur, *s_noz_tgt, *s_noz_bar, *s_noz_mark;
-static lv_obj_t *s_bed_cur, *s_bed_tgt, *s_bed_bar, *s_bed_mark;
-static lv_obj_t *s_cham_cur, *s_cham_bar;
-static lv_obj_t *s_temp_remain;
-// AMS 页(最多 4 台 × 4 槽)
-static lv_obj_t *s_ams_title[4], *s_ams_sub[4];
-static lv_obj_t *s_ams_swatch[4][4], *s_ams_type[4][4], *s_ams_remain[4][4], *s_ams_mark[4][4];
-static lv_obj_t *s_ams_gauge[4][4];     // 槽位右侧余量竖条
-// 设备页
-static lv_obj_t *s_d_sn, *s_d_rssi, *s_d_ip, *s_d_cloud, *s_d_wifi_rssi, *s_d_wifi, *s_d_uptime;
-static lv_obj_t *s_d_hms_panel, *s_d_hms_lbl;
-// 上次打印状态(用于状态切换提示音)
-static char s_last_state[10];
+static lv_obj_t *s_temp_title;
+static lv_obj_t *s_head_compact[4]; // one compact row per nozzle, no pages
+static lv_obj_t *s_chamber_lbl;
+static lv_obj_t *s_bed_value, *s_chamber_value;
+static lv_obj_t *s_ams_title[4];
+static lv_obj_t *s_ams_swatch[4][4], *s_ams_type[4][4], *s_ams_remain[4][4];
+static lv_obj_t *s_d_sn, *s_d_model, *s_d_cloud, *s_d_wifi, *s_d_ip, *s_d_hms_lbl;
+static lv_obj_t *s_sig_bar[4]; // local WiFi RSSI bars
+static lv_obj_t *s_report_name, *s_report_value, *s_report_line;
+static spirit_dispatch_t s_dispatch;
+static int s_report_machine;
+static int s_temperature_pair;
+static int s_built_slot = -1;
 
-// 脏检查:数据快照没变时跳过整页重绘,只刷时钟/电量(省电、避免无谓重排)
-static bambu_state_t s_prev;
-static bool s_prev_valid;
-static bool s_dirty = true;       // 按键等交互强制重绘
+static bambu_state_t s_work;
+static spirit_dispatch_status_t s_dispatch_status[BAMBU_MACHINE_MAX];
+static char s_dispatch_states[BAMBU_MACHINE_MAX][10];
+static spirit_event_latch_t s_events[BAMBU_MACHINE_MAX];
+static bool s_event_fresh[BAMBU_MACHINE_MAX];
 
 static void refresh_all(void);    // 前向声明(tick_fast 要调,定义在后面)
 static void ov_refresh(void);     // 前向声明(refresh_all 概览模式要调)
 static void detail_build(void);   // 前向声明(概览→详情切换要用)
 static void detail_free(void);    // 前向声明(详情→概览切换要用)
-static void ensure_ams_pages(int n); // 前向声明(refresh_all 随 AMS 数据补建页)
+static lv_obj_t *page_new(void);
 static void apply_page_vis(int show); // 前向声明(refresh_all 懒建页后收敛可见性)
 static void show_page(int idx);   // 前向声明(ov_key 进详情要调)
 static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev);
+
+static uint64_t spirit_now_ms(void)
+{
+    return (uint64_t)(esp_timer_get_time() / 1000);
+}
+
+static void bubble_show(const char *text, bool sticky)
+{
+    if (!s_bubble || !s_bubble_lbl || !text || !text[0]) return;
+    lv_label_set_text(s_bubble_lbl, text);
+    lv_obj_remove_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_bubble);
+    s_bubble_sticky = sticky;
+    s_bubble_until_ms = spirit_now_ms() + BUBBLE_MS;
+}
+
+// Low-frequency visual chatter. It never calls the voice worker; the linked
+// state clips remain event-only. Each role has three wordings per branch and
+// the pick rotates, so the same line does not come back every time.
+static const char *chatter_text(spirit_skin_id_t skin, spirit_action_t action,
+                                const bambu_state_t *st, uint64_t now_ms)
+{
+    static const char *const idle[SPIRIT_SKIN_COUNT][3] = {
+        {"本鱼待命中。", "闲着，随时开工呀。", "没事做，陪你待着。"},
+        {"暂时没有任务。", "空闲中，随时可以开始。", "没有在打的单子。"},
+        {"当前无打印任务。", "空闲，等待任务。", "没有进行中的任务。"},
+        {"这会儿空闲。", "闲着，等你。", "没活儿，待机。"},
+        {"幕间休息，等下一场。", "舞台就绪，等待任务。", "有新消息再叫我。"},
+        {"这会儿没单，陪你玩会儿。", "机器歇着，我也歇会儿。", "主人，下一单打什么？"},
+    };
+    static const char *const printing[SPIRIT_SKIN_COUNT][3] = {
+        {"还在打印。", "机器还在动。", "打着呢，我看着。"},
+        {"我在这儿看着进度。", "打印进行中。", "还在打，我留意着。"},
+        {"状态已核对，继续观察。", "打印中，持续观察。", "任务进行中。"},
+        {"这单还在打。", "还在跑，我盯着。", "没打完，等着。"},
+        {"这场演出还在继续。", "下一幕还在准备。", "进度有消息，我会告诉你。"},
+        {"这单我盯着呢。", "机器忙着，我来陪你。", "还在打，有新消息叫你。"},
+    };
+    static char buf[64];
+    static unsigned pick;
+    unsigned role = (unsigned)skin < SPIRIT_SKIN_COUNT ? (unsigned)skin : 0;
+    unsigned k = pick++ % 3u;
+    if (action == SPIRIT_PRINTING) {
+        const char *model = st->model[0] ? st->model : "打印机";
+        if (app_telemetry_fresh(st->remain_valid, st->remain_ms, now_ms)) {
+            int remain = st->remain_min;
+            switch (role) {
+            case 0:
+                if (k == 0) snprintf(buf, sizeof(buf), "还剩%d分钟，我盯着呢。", remain);
+                else if (k == 1) snprintf(buf, sizeof(buf), "还有%d分钟，我陪着你。", remain);
+                else snprintf(buf, sizeof(buf), "%d分钟就好，别急呀。", remain);
+                break;
+            case 1:
+                if (k == 0) snprintf(buf, sizeof(buf), "进度%d%%，还剩%d分钟。", st->pct, remain);
+                else if (k == 1) snprintf(buf, sizeof(buf), "还剩%d分钟，节奏正常。", remain);
+                else snprintf(buf, sizeof(buf), "大约%d分钟后完成。", remain);
+                break;
+            case 2:
+                if (k == 0) snprintf(buf, sizeof(buf), "还剩%d分钟，继续观察。", remain);
+                else if (k == 1) snprintf(buf, sizeof(buf), "剩余%d分钟，状态稳定。", remain);
+                else snprintf(buf, sizeof(buf), "%d分钟后可以验收。", remain);
+                break;
+            case 4:
+                snprintf(buf, sizeof(buf), "这场演出还剩%d分钟。", remain);
+                break;
+            case 5:
+                snprintf(buf, sizeof(buf), "主人，这单还剩%d分钟哦。", remain);
+                break;
+            default:
+                if (k == 0) snprintf(buf, sizeof(buf), "这单还剩%d分钟。", remain);
+                else if (k == 1) snprintf(buf, sizeof(buf), "还有%d分钟，我盯着。", remain);
+                else snprintf(buf, sizeof(buf), "%d分钟，等着吧。", remain);
+                break;
+            }
+            return buf;
+        }
+        if (app_telemetry_fresh(st->pct_valid, st->pct_ms, now_ms)) {
+            switch (role) {
+            case 0:
+                if (k == 0) snprintf(buf, sizeof(buf), "%s %d%%", model, st->pct);
+                else if (k == 1) snprintf(buf, sizeof(buf), "已经%d%%啦。", st->pct);
+                else snprintf(buf, sizeof(buf), "%s打到%d%%。", model, st->pct);
+                break;
+            case 1:
+                if (k == 0) snprintf(buf, sizeof(buf), "%s打印中", model);
+                else if (k == 1) snprintf(buf, sizeof(buf), "当前进度%d%%，继续。", st->pct);
+                else snprintf(buf, sizeof(buf), "打印到%d%%了。", st->pct);
+                break;
+            case 2:
+                if (k == 0) snprintf(buf, sizeof(buf), "打印进度%d%%", st->pct);
+                else if (k == 1) snprintf(buf, sizeof(buf), "进度%d%%，已核对。", st->pct);
+                else snprintf(buf, sizeof(buf), "当前完成%d%%。", st->pct);
+                break;
+            case 4:
+                snprintf(buf, sizeof(buf), "这场演出进度%d%%。", st->pct);
+                break;
+            case 5:
+                snprintf(buf, sizeof(buf), "打到%d%%啦，我还盯着呢。", st->pct);
+                break;
+            default:
+                if (k == 0) snprintf(buf, sizeof(buf), "这单%d%%了。", st->pct);
+                else if (k == 1) snprintf(buf, sizeof(buf), "%d%%，不急。", st->pct);
+                else snprintf(buf, sizeof(buf), "进度%d%%。", st->pct);
+                break;
+            }
+            return buf;
+        }
+        return printing[role][k];
+    }
+    return idle[role][k];
+}
+
+static int voice_kind_for_action(spirit_action_t action);
+
+static const char *page_hint_text(int slot, spirit_skin_id_t skin,
+                                  const bambu_state_t *st, uint64_t now_ms,
+                                  unsigned variant)
+{
+    unsigned role = (unsigned)skin < SPIRIT_SKIN_COUNT ? (unsigned)skin : 0;
+    if (slot == 0) {
+        spirit_action_t action = spirit_action_for_status(&(spirit_status_t){
+            .cloud_online = st->cloud == BAMBU_CLOUD_ONLINE,
+            .state_received = st->state_received,
+            .state_updated_ms = st->state_updated_ms,
+            .gcode_state = st->gcode_state,
+            .print_error = st->print_error,
+            .job_generation = st->job_generation,
+            .task_token = spirit_task_token(st->task_id),
+        }, now_ms);
+        if (action == SPIRIT_PRINTING || action == SPIRIT_IDLE) {
+            return chatter_text(skin, action, st, now_ms);
+        }
+        int kind = voice_kind_for_action(action);
+        if (kind >= 0) return app_notify_voice_text(skin, (unsigned)kind);
+        return NULL;
+    }
+    // Scene-specific spoken line for the temperature/AMS/device pages, so the
+    // bubble text always matches the clip (v218-page-voice-v03).
+    if (slot >= 1 && slot <= 4) return app_notify_page_text(role, 0, variant);
+    if (slot >= 5 && slot <= 8) return app_notify_page_text(role, 1, variant);
+    if (slot == 9) return app_notify_page_text(role, 2, variant);
+    return NULL;
+}
+
+static int voice_kind_for_action(spirit_action_t action)
+{
+    switch (action) {
+    case SPIRIT_PRINTING:  return 0;
+    case SPIRIT_PAUSED:    return 1;
+    case SPIRIT_COMPLETED: return 2;
+    case SPIRIT_FAILED:    return 3;
+    case SPIRIT_RUNOUT:    return 4;
+    default:               return -1;
+    }
+}
+
+static spirit_status_t spirit_status(const bambu_state_t *st)
+{
+    return (spirit_status_t) {
+        .cloud_online = st->cloud == BAMBU_CLOUD_ONLINE,
+        .state_received = st->state_received,
+        .state_updated_ms = st->state_updated_ms,
+        .gcode_state = st->gcode_state,
+        .print_error = st->print_error,
+        .job_generation = st->job_generation,
+        .task_token = spirit_task_token(st->task_id),
+    };
+}
 
 // 按键回调跑在 button 组件的小栈任务(默认 2~3KB)里,而翻页/重绘很重:
 // refresh_all() 会把 bambu_state_t 大结构体上栈 + memcpy + 一堆 LVGL/字体调用,
 // 在回调里直接干会爆栈 → 看门狗/栈溢出 → 设备重启(「按两回上键就重启」的根因)。
 // 所以按键回调只记下事件,由 s_fast 定时器在 LVGL 任务(栈足够)里真正执行。
-static void request_refresh(void) { s_dirty = true; s_need_refresh = true; }
+static void request_refresh(void) { s_need_refresh = true; }
 
 static void tick_fast(lv_timer_t *t)
 {
@@ -155,86 +344,36 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, uint32_t color,
     return l;
 }
 
-static void set_bar_pct(lv_obj_t *bar, int pct, int max_w)
+// One global bubble on the screen (not on a page), so an event is visible
+// regardless of which detail page the user is currently reading.
+static void bubble_build(void)
 {
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    lv_obj_set_width(bar, max_w * pct / 100);
+    if (s_bubble || !s_scr) return;
+    s_bubble = rect(s_scr, 4, 286, 232, 32, C_PANEL2); // page y=234 + PAGE_Y
+    lv_obj_set_style_radius(s_bubble, 10, 0);
+    lv_obj_set_style_border_width(s_bubble, 1, 0);
+    lv_obj_set_style_border_color(s_bubble, lv_color_hex(C_LINE), 0);
+    s_bubble_lbl = label(s_bubble, &font_zh14, C_TEXT, LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_size(s_bubble_lbl, 220, 18);
+    lv_obj_set_pos(s_bubble_lbl, 6, 6);
+    lv_label_set_long_mode(s_bubble_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
 }
 
-// 目标温度刻度线:竖线画在进度条上对应目标值的位置
-static void set_bar_mark(lv_obj_t *mark, int pct, int max_w, int x0)
+static void refresh_bubble(uint64_t now_ms)
 {
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    lv_obj_set_x(mark, x0 + max_w * pct / 100 - 1);
-}
-
-// 圆角卡片(带细边框)
-static lv_obj_t *card(lv_obj_t *parent, int x, int y, int w, int h, uint32_t bg)
-{
-    lv_obj_t *o = rect(parent, x, y, w, h, bg);
-    lv_obj_set_style_radius(o, 8, 0);
-    lv_obj_set_style_border_width(o, 1, 0);
-    lv_obj_set_style_border_color(o, lv_color_hex(C_LINE), 0);
-    return o;
-}
-
-// 状态标签 chip:左标签 + 右等宽数值(可指定值颜色)
-static void chip_build(lv_obj_t *parent, int x, int y, int w, int h,
-                       const char *k, uint32_t val_col, lv_obj_t **kl, lv_obj_t **vl)
-{
-    lv_obj_t *o = rect(parent, x, y, w, h, C_PANEL2);
-    lv_obj_set_style_radius(o, 6, 0);
-    lv_obj_set_style_border_width(o, 1, 0);
-    lv_obj_set_style_border_color(o, lv_color_hex(C_LINE), 0);
-    *kl = label(o, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(*kl, k);
-    lv_obj_align(*kl, LV_ALIGN_LEFT_MID, 7, 0);
-    *vl = label(o, &lv_font_montserrat_14, val_col, LV_TEXT_ALIGN_RIGHT);
-    lv_label_set_text(*vl, "-");
-    lv_obj_align(*vl, LV_ALIGN_RIGHT_MID, -7, 0);
-}
-
-// ------------------------------------------------------------ 像素大数字
-
-// 4x7 点阵数字(行值 4bit,高位在左)
-static const uint8_t DIG[10][7] = {
-    { 6,  9,  9,  9,  9,  9,  6 }, // 0
-    { 2,  6,  2,  2,  2,  2,  7 }, // 1
-    { 6,  9,  1,  2,  4,  8, 15 }, // 2
-    { 14, 1,  2,  6,  2,  1, 14 }, // 3
-    { 2,  6,  10, 9,  15, 1,  1 }, // 4
-    { 15, 8,  14, 1,  1,  9,  6 }, // 5
-    { 6,  8,  14, 9,  9,  9,  6 }, // 6
-    { 15, 1,  2,  4,  4,  4,  4 }, // 7
-    { 6,  9,  6,  9,  9,  9,  6 }, // 8
-    { 6,  9,  9,  9,  7,  1,  6 }, // 9
-};
-
-// 在容器里重画一串数字,scale=单格像素
-static void draw_digits(lv_obj_t *box, const char *txt, int scale, uint32_t color)
-{
-    lv_obj_clean(box);
-    int adv = 5 * scale;
-    int x = 0;
-    for (const char *p = txt; *p; p++) {
-        if (*p < '0' || *p > '9') continue;
-        const uint8_t *pat = DIG[*p - '0'];
-        for (int r = 0; r < 7; r++) {
-            for (int c = 0; c < 4; c++) {
-                if (pat[r] & (1 << (3 - c))) {
-                    rect(box, x + c * scale, r * scale, scale, scale, color);
-                }
-            }
-        }
-        x += adv;
+    if (s_bubble_until_ms && now_ms >= s_bubble_until_ms) {
+        s_bubble_until_ms = 0;
+        s_bubble_sticky = false;
+        if (s_bubble) lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
     }
-}
-
-static int digits_width(int n, int scale)
-{
-    return n * 5 * scale;
+    if (!s_bubble) return;
+    if (s_bubble_until_ms > now_ms) {
+        lv_obj_remove_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_bubble);
+    } else {
+        lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // 状态 → 中文/颜色
@@ -247,16 +386,6 @@ static const char *state_zh(const char *st, uint32_t *col)
     if (!strcmp(st, "FINISH"))                 { *col = C_CYAN;  return "打印完成"; }
     *col = C_DIM;
     return st;
-}
-
-static uint32_t state_ring_color(const char *st)
-{
-    if (!st || !st[0] || !strcmp(st, "IDLE"))  return C_DIM;
-    if (!strcmp(st, "RUNNING"))                return C_GREEN;
-    if (!strcmp(st, "PAUSE"))                  return C_YELLOW;
-    if (!strcmp(st, "FAILED"))                 return C_RED;
-    if (!strcmp(st, "FINISH"))                 return C_CYAN;
-    return C_DIM;
 }
 
 // ------------------------------------------------------------ 头部
@@ -277,7 +406,7 @@ static void header_build(void)
 
     // 页点(居中,最多 8 个,按实际页数显示)
     for (int i = 0; i < PAGE_MAX; i++) {
-        s_dots[i] = rect(s_scr, 88 + i * 10, 13, 5, 5, C_LINE);
+        s_dots[i] = rect(s_scr, 76 + i * 9, 13, 5, 5, C_LINE);
         lv_obj_set_style_radius(s_dots[i], LV_RADIUS_CIRCLE, 0);
     }
 
@@ -306,8 +435,8 @@ static void status_bar_build(void)
     s_bar_lbl = label(s_bar, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
     lv_label_set_text(s_bar_lbl, "等待数据");
     lv_label_set_long_mode(s_bar_lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_bar_lbl, 226);
-    lv_obj_align(s_bar_lbl, LV_ALIGN_LEFT_MID, 7, 0);
+    lv_obj_set_size(s_bar_lbl, 226, 16); // One line, including long machine names/SSIDs.
+    lv_obj_set_pos(s_bar_lbl, 7, 1);
 }
 
 static void refresh_status_bar(const bambu_state_t *st)
@@ -315,7 +444,9 @@ static void refresh_status_bar(const bambu_state_t *st)
     // 多机时前缀机器名,单机保持原样
     const char *cust = app_mqtt_name(s_midx);
     int machines = app_mqtt_machine_count();
-    if (st->hms_count > 0) {
+    spirit_status_t status = spirit_status(st);
+    bool fresh = spirit_status_fresh(&status, spirit_now_ms());
+    if (fresh && st->hms_count > 0) {
         static char buf[MSG_MAX];
         const char *txt = hms_lookup(st->hms[0].code, buf, sizeof(buf));
         if (cust && machines >= 2) {
@@ -330,18 +461,23 @@ static void refresh_status_bar(const bambu_state_t *st)
         lv_obj_set_style_text_color(s_bar_lbl,
             lv_color_hex(paused ? 0x241A00 : 0xFFFFFF), 0);
     } else {
-        const char *cloud = st->cloud == BAMBU_CLOUD_ONLINE    ? "云在线"
-                          : st->cloud == BAMBU_CLOUD_CONNECTING ? "云连接中" : "云离线";
+        // 头部圆点已经表达云状态;这里只补网络上下文,不再重复“云在线”文字。
         // 状态条常驻显示当前连的 WiFi 名,出门自动切网后不用翻页也能确认。
         // 名字最长 32 字节,缓冲给足;超宽由 label 的 DOT 模式末尾省略。
+        const char *cloud = st->cloud == BAMBU_CLOUD_ONLINE    ? NULL
+                          : st->cloud == BAMBU_CLOUD_CONNECTING ? "连接中" : "离线";
         const char *ssid = app_wifi_current_ssid();
         static char t[96];
         if (cust && machines >= 2) {
-            if (ssid) snprintf(t, sizeof(t), "%s · %s · %s", cust, cloud, ssid);
-            else      snprintf(t, sizeof(t), "%s · %s", cust, cloud);
+            if (cloud && ssid)      snprintf(t, sizeof(t), "%s · %s · %s", cust, cloud, ssid);
+            else if (cloud)         snprintf(t, sizeof(t), "%s · %s · 未联网", cust, cloud);
+            else if (ssid)          snprintf(t, sizeof(t), "%s · %s", cust, ssid);
+            else                    snprintf(t, sizeof(t), "%s · 在线", cust);
         } else {
-            if (ssid) snprintf(t, sizeof(t), "%s · %s", cloud, ssid);
-            else      snprintf(t, sizeof(t), "%s · 未联网", cloud);
+            if (cloud && ssid)      snprintf(t, sizeof(t), "%s · %s", cloud, ssid);
+            else if (cloud)         snprintf(t, sizeof(t), "%s · 未联网", cloud);
+            else if (ssid)          snprintf(t, sizeof(t), "%s", ssid);
+            else                    snprintf(t, sizeof(t), "在线");
         }
         lv_label_set_text(s_bar_lbl, t);
         lv_obj_set_style_bg_color(s_bar, lv_color_hex(C_PANEL), 0);
@@ -354,443 +490,317 @@ static void refresh_status_bar(const bambu_state_t *st)
 static void page_progress_build(lv_obj_t *p)
 {
     s_status = label(p, &font_zh20, C_GREEN, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(s_status, "空闲");
+    lv_label_set_text(s_status, "等待数据");
     lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 0);
 
     s_job = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(s_job, "等待任务");
-    lv_obj_align(s_job, LV_ALIGN_TOP_MID, 0, 22);
+    lv_label_set_text(s_job, "");
     lv_label_set_long_mode(s_job, LV_LABEL_LONG_CLIP);
     lv_obj_set_width(s_job, 220);
+    lv_obj_align(s_job, LV_ALIGN_TOP_MID, 0, 24);
 
-    // 大号居中百分比(像素数字) + 横向圆角进度条(替代原折线圆环)
-    s_pct_box = rect(p, 0, 0, 4, 4, C_BG);
-    lv_obj_set_style_bg_opa(s_pct_box, LV_OPA_TRANSP, 0);
-    draw_digits(s_pct_box, "0", 7, C_TEXT);
-    lv_obj_set_pos(s_pct_box, 0, 0);
+    // Native 112x112 image at screen(64,92), never scaled at runtime.
+    app_spirit_view_create(p, 64, 40);
 
-    s_pct_sign = label(p, &font_zh20, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(s_pct_sign, "%");
-    lv_obj_set_style_text_font(s_pct_sign, &font_zh20, 0);
+    // A single font label replaces dozens of per-digit rectangle objects.
+    s_primary = label(p, &lv_font_montserrat_36, C_TEXT, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(s_primary, "--");
+    lv_obj_align(s_primary, LV_ALIGN_TOP_MID, 0, 154);
+    s_prog_track = rect(p, 20, 204, 200, 4, C_LINE);
+    s_prog_fill = rect(p, 20, 204, 0, 4, C_GREEN);
 
-    // 横向进度条:轨道(圆角卡片) + 填充
-    s_prog_track = card(p, 20, 150, 200, 16, C_PANEL2);
-    s_prog_fill  = rect(p, 22, 152, 0, 12, C_GREEN);
-    lv_obj_set_style_radius(s_prog_fill, 6, 0);
-
-    // 温度/层/风扇 chip(2x2)
-    lv_obj_t *kl;
-    chip_build(p, 14, 188, 108, 20, "喷嘴", C_ORANGE, &kl, &s_c_noz_v);
-    chip_build(p, 118, 188, 108, 20, "热床", C_GREEN_L, &kl, &s_c_bed_v);
-    chip_build(p, 14, 210, 108, 20, "层", C_CYAN, &kl, &s_c_layer_v);
-    chip_build(p, 118, 210, 108, 20, "风扇", C_DIM, &kl, &s_c_fan_v);
-
-    // 剩余 / 完成时刻(OK 切换)
-    s_time_lbl = label(p, &font_zh20, C_GREEN_L, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(s_time_lbl, "--");
-    lv_obj_align(s_time_lbl, LV_ALIGN_TOP_MID, 0, 232);
-
-    s_time_hint = label(p, &font_zh14, 0x445262, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(s_time_hint, "OK 切换剩余/完成");
-    lv_obj_align(s_time_hint, LV_ALIGN_TOP_MID, 0, 254);
+    s_time_lbl = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(s_time_lbl, "");
+    lv_obj_align(s_time_lbl, LV_ALIGN_TOP_MID, 0, 218);
+    s_time_hint = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(s_time_hint, "OK 刷新");
+    lv_obj_align(s_time_hint, LV_ALIGN_TOP_MID, 0, 242);
 }
 
 static void refresh_progress(const bambu_state_t *st)
 {
-    uint32_t st_col;
-    const char *zh = state_zh(st->gcode_state, &st_col);
-    lv_label_set_text(s_status, zh);
-    lv_obj_set_style_text_color(s_status, lv_color_hex(st_col), 0);
-    lv_label_set_text(s_job, st->job[0] ? st->job : "等待任务");
-
-    // 大号百分比 + 横向进度条(替代折线圆环)
-    uint32_t num_col = state_ring_color(st->gcode_state);
-    char dts[8];
-    snprintf(dts, sizeof(dts), "%d", st->pct);
-    int n = strlen(dts);
-    int scale = 7;
-    int dig_h = 7 * scale;
-    int num_w = digits_width(n, scale);
-    int pct_w = 18, gap = 6;
-    int total = num_w + gap + pct_w;
-    int sx = (240 - total) / 2;
-    int cy = 95;
-    lv_obj_set_size(s_pct_box, num_w, dig_h);
-    lv_obj_set_pos(s_pct_box, sx, cy - dig_h / 2);
-    draw_digits(s_pct_box, dts, scale, num_col);
-    lv_obj_set_pos(s_pct_sign, sx + num_w + gap, cy - 11);
-    lv_obj_set_style_text_color(s_pct_sign, lv_color_hex(num_col), 0);
-
-    // 进度条填充(轨道内 2px 边距,最大宽 196)
-    int fill_w = (196 * st->pct) / 100;
-    if (fill_w < 0) fill_w = 0; else if (fill_w > 196) fill_w = 196;
-    lv_obj_set_width(s_prog_fill, fill_w);
-    lv_obj_set_style_bg_color(s_prog_fill, lv_color_hex(num_col), 0);
-
-    // 温度/层/风扇 chip(温度显示 当前/目标)
-    char t[24];
-    snprintf(t, sizeof(t), "%d/%d", st->nozzle_t, st->nozzle_target);
-    lv_label_set_text(s_c_noz_v, t);
-    snprintf(t, sizeof(t), "%d/%d", st->bed_t, st->bed_target);
-    lv_label_set_text(s_c_bed_v, t);
-    snprintf(t, sizeof(t), "%d/%d", st->layer, st->total_layer);
-    lv_label_set_text(s_c_layer_v, t);
-    snprintf(t, sizeof(t), "%d%%", st->fan_cooling_pct);
-    lv_label_set_text(s_c_fan_v, t);
-
-    // 剩余 ↔ 完成时刻
-    char t2[64];
-    if (st->remain_min > 0) {
-        if (!s_show_eta) {
-            int h = st->remain_min / 60, m = st->remain_min % 60;
-            if (h > 0) snprintf(t2, sizeof(t2), "剩余 %dh%02dm", h, m);
-            else       snprintf(t2, sizeof(t2), "剩余 %dm", m);
-            lv_label_set_text(s_time_hint, "OK 切换完成时刻");
-        } else if (app_wifi_time_ready()) {
-            time_t eta = time(NULL) + (time_t)st->remain_min * 60;
-            struct tm tmv;
-            localtime_r(&eta, &tmv);
-            snprintf(t2, sizeof(t2), "%02d:%02d 完成", tmv.tm_hour, tmv.tm_min);
-            lv_label_set_text(s_time_hint, "OK 切换剩余时间");
-        } else {
-            snprintf(t2, sizeof(t2), "--:-- 完成");
-            lv_label_set_text(s_time_hint, "OK 切换剩余时间");
-        }
-        lv_label_set_text(s_time_lbl, t2);
+    uint64_t now_ms = spirit_now_ms();
+    spirit_status_t status = spirit_status(st);
+    bool fresh = spirit_status_fresh(&status, now_ms);
+    spirit_action_t action = spirit_action_for_status(&status, now_ms);
+    uint32_t color = C_DIM;
+    const char *title;
+    if (!fresh) {
+        if (st->cloud == BAMBU_CLOUD_CONNECTING) title = "连接中";
+        else if (st->cloud != BAMBU_CLOUD_ONLINE) title = "离线";
+        else if (!st->state_received) title = "等待数据";
+        else title = "数据过期";
+        color = C_YELLOW;
+    } else if (action == SPIRIT_RUNOUT) {
+        title = "缺料";
+        color = C_YELLOW;
     } else {
-        lv_label_set_text(s_time_lbl, "--");
-        lv_label_set_text(s_time_hint, "OK 切换剩余/完成");
+        title = state_zh(st->gcode_state, &color);
     }
+    lv_label_set_text(s_status, title);
+    lv_obj_set_style_text_color(s_status, lv_color_hex(color), 0);
+    lv_label_set_text(s_job, fresh && st->job[0] ? st->job : "");
+
+    bool finished = fresh && !strcmp(st->gcode_state, "FINISH");
+    bool pct_known = finished || app_telemetry_fresh(st->pct_valid, st->pct_ms, now_ms);
+    bool in_job = fresh && (action == SPIRIT_PRINTING || action == SPIRIT_PAUSED ||
+                           action == SPIRIT_RUNOUT || finished);
+    int pct = finished ? 100 : st->pct;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    lv_obj_set_style_text_font(s_primary,
+                              in_job || !fresh ? &lv_font_montserrat_36 : &font_zh20, 0);
+    if (in_job && pct_known) lv_label_set_text_fmt(s_primary, "%d%%", pct);
+    else if (in_job) lv_label_set_text(s_primary, "--");
+    else lv_label_set_text(s_primary, !fresh ? "--" : action == SPIRIT_FAILED ? "请检查" : "待命");
+    lv_obj_set_style_text_color(s_primary, lv_color_hex(color), 0);
+    // Different font sizes keep the same visual center below the sprite.
+    lv_obj_align(s_primary, LV_ALIGN_TOP_MID, 0, in_job || !fresh ? 154 : 162);
+    if (in_job && pct_known) {
+        lv_obj_remove_flag(s_prog_track, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_prog_fill, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_width(s_prog_fill, pct * 200 / 100);
+        lv_obj_set_style_bg_color(s_prog_fill, lv_color_hex(color), 0);
+    } else {
+        lv_obj_add_flag(s_prog_track, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_prog_fill, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    char time_text[80] = "";
+    bool remain_fresh = app_telemetry_fresh(st->remain_valid, st->remain_ms, now_ms);
+    if (in_job && !finished) {
+        if (remain_fresh) {
+            if (s_show_eta && app_wifi_time_ready()) {
+                time_t eta = time(NULL) + (time_t)st->remain_min * 60;
+                struct tm tmv;
+                localtime_r(&eta, &tmv);
+                snprintf(time_text, sizeof(time_text), "%02d:%02d 完成", tmv.tm_hour, tmv.tm_min);
+            } else if (s_show_eta) {
+                snprintf(time_text, sizeof(time_text), "--:-- 完成");
+            } else if (st->remain_min >= 60) {
+                snprintf(time_text, sizeof(time_text), "剩余 %dh%02dm", st->remain_min / 60, st->remain_min % 60);
+            } else {
+                snprintf(time_text, sizeof(time_text), "剩余 %dm", st->remain_min);
+            }
+        } else {
+            snprintf(time_text, sizeof(time_text), "%s", s_show_eta ? "--:-- 完成" : "剩余 --");
+        }
+        // The value line itself carries the OK affordance; a separate instruction
+        // label would repeat what the layout already shows.
+        if (fresh && action == SPIRIT_PRINTING) {
+            size_t used = strlen(time_text);
+            if (used + 6 < sizeof(time_text))
+                snprintf(time_text + used, sizeof(time_text) - used, " · OK");
+        }
+    }
+    lv_label_set_text(s_time_lbl, time_text);
+    const char *hint = "";
+    if (!fresh) hint = "OK 刷新";
+    else if (finished) hint = app_spirit_view_finish_acknowledged(s_midx) ? "等待下一次打印" : "按 OK 确认";
+    else if (action == SPIRIT_FAILED) hint = "查看设备页告警";
+    else if (action == SPIRIT_RUNOUT) hint = "请补充耗材";
+    else if (action == SPIRIT_PAUSED) hint = "嗯？暂停了，请检查。";
+    else if (action == SPIRIT_IDLE) hint = "等待下一次打印";
+    lv_label_set_text(s_time_hint, hint);
+    // The bubble sits on the same bottom strip; hide the hint while it is up.
+    lv_obj_set_hidden(s_time_hint, s_bubble_until_ms > now_ms);
 }
 
 // ------------------------------------------------------------ 温度页
 
+
 static void page_temp_build(lv_obj_t *p)
 {
-    // 喷头
-    card(p, 10, 2, 220, 62, C_PANEL);
-    lv_obj_t *n1 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n1, "喷头"); lv_obj_align(n1, LV_ALIGN_TOP_LEFT, 20, 8);
-    s_noz_cur = label(p, &lv_font_montserrat_20, C_ORANGE, LV_TEXT_ALIGN_RIGHT);
-    lv_label_set_text(s_noz_cur, "--");
-    lv_obj_align(s_noz_cur, LV_ALIGN_TOP_RIGHT, -20, 4);
-    s_noz_tgt = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_RIGHT);
-    lv_label_set_text(s_noz_tgt, "目标 --");
-    lv_obj_align(s_noz_tgt, LV_ALIGN_TOP_RIGHT, -20, 30);
-    rect(p, 20, 50, 200, 6, C_LINE);
-    s_noz_bar = rect(p, 20, 50, 0, 6, C_ORANGE);
-    s_noz_mark = rect(p, 20, 45, 2, 16, C_TEXT);
-
-    // 热床
-    card(p, 10, 68, 220, 62, C_PANEL);
-    lv_obj_t *n2 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n2, "热床"); lv_obj_align(n2, LV_ALIGN_TOP_LEFT, 20, 74);
-    s_bed_cur = label(p, &lv_font_montserrat_20, C_GREEN_L, LV_TEXT_ALIGN_RIGHT);
-    lv_label_set_text(s_bed_cur, "--");
-    lv_obj_align(s_bed_cur, LV_ALIGN_TOP_RIGHT, -20, 70);
-    s_bed_tgt = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_RIGHT);
-    lv_label_set_text(s_bed_tgt, "目标 --");
-    lv_obj_align(s_bed_tgt, LV_ALIGN_TOP_RIGHT, -20, 96);
-    rect(p, 20, 116, 200, 6, C_LINE);
-    s_bed_bar = rect(p, 20, 116, 0, 6, C_GREEN_L);
-    s_bed_mark = rect(p, 20, 111, 2, 16, C_TEXT);
-
-    // 腔温
-    card(p, 10, 134, 220, 58, C_PANEL);
-    lv_obj_t *n3 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n3, "腔温"); lv_obj_align(n3, LV_ALIGN_TOP_LEFT, 20, 148);
-    s_cham_cur = label(p, &lv_font_montserrat_20, C_CYAN, LV_TEXT_ALIGN_RIGHT);
-    lv_label_set_text(s_cham_cur, "--");
-    lv_obj_align(s_cham_cur, LV_ALIGN_TOP_RIGHT, -20, 144);
-    rect(p, 20, 176, 200, 6, C_LINE);
-    s_cham_bar = rect(p, 20, 176, 0, 6, C_CYAN);
-
-    // 预计剩余
-    card(p, 10, 196, 220, 58, C_PANEL);
-    lv_obj_t *n4 = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(n4, "预计剩余"); lv_obj_align(n4, LV_ALIGN_TOP_LEFT, 20, 214);
-    s_temp_remain = label(p, &lv_font_montserrat_20, C_GREEN_L, LV_TEXT_ALIGN_RIGHT);
-    lv_label_set_text(s_temp_remain, "--");
-    lv_obj_align(s_temp_remain, LV_ALIGN_TOP_RIGHT, -20, 210);
+    s_temp_title = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_pos(s_temp_title, 10, 4); lv_obj_set_width(s_temp_title, 220);
+    app_spirit_view_create(p, 64, 18);
+    for (int i = 0; i < 4; i++) {
+        s_head_compact[i] = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_pos(s_head_compact[i], 14, 132 + i * 18);
+        lv_obj_set_width(s_head_compact[i], 212);
+        lv_label_set_long_mode(s_head_compact[i], LV_LABEL_LONG_DOT);
+        lv_obj_add_flag(s_head_compact[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    rect(p, 14, 206, 212, 1, C_LINE);
+    lv_obj_t *bed = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+    lv_label_set_text(bed, "热床"); lv_obj_set_pos(bed, 14, 212);
+    s_bed_value = label(p, &font_zh14, C_GREEN_L, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_set_pos(s_bed_value, 60, 212); lv_obj_set_width(s_bed_value, 72);
+    s_chamber_lbl = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+    lv_label_set_text(s_chamber_lbl, "腔温"); lv_obj_set_pos(s_chamber_lbl, 140, 212);
+    s_chamber_value = label(p, &font_zh14, C_CYAN, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_set_pos(s_chamber_value, 190, 212); lv_obj_set_width(s_chamber_value, 36);
 }
 
 static void refresh_temp(const bambu_state_t *st)
 {
-    char t[24];
-    // 量程跟随目标温度:PLA 热床 60° 时条也能走满,不再看着像"只到一半"
-    int noz_max = st->nozzle_target > 0 ? st->nozzle_target + 30 : 300;
-    int bed_max = st->bed_target > 0 ? st->bed_target + 20 : 120;
-    if (noz_max < 200) noz_max = 200;
-    if (bed_max < 60)  bed_max = 60;
+    uint64_t now = spirit_now_ms(); bool online = st->cloud == BAMBU_CLOUD_ONLINE;
+    bool has_head = st->structured_heads && st->heads.count > 0;
+    int count = has_head ? (int)st->heads.count : 1;
+    if (count > 4) count = 4;
+    lv_label_set_text_fmt(s_temp_title, count > 1 ? "温度 · %d 喷嘴" : "温度", count);
 
-    snprintf(t, sizeof(t), "%d°", st->nozzle_t);
-    lv_label_set_text(s_noz_cur, t);
-    snprintf(t, sizeof(t), "目标 %d°", st->nozzle_target);
-    lv_label_set_text(s_noz_tgt, t);
-    set_bar_pct(s_noz_bar, st->nozzle_t * 100 / noz_max, 200);
-    set_bar_mark(s_noz_mark, st->nozzle_target * 100 / noz_max, 200, 20);
-
-    snprintf(t, sizeof(t), "%d°", st->bed_t);
-    lv_label_set_text(s_bed_cur, t);
-    snprintf(t, sizeof(t), "目标 %d°", st->bed_target);
-    lv_label_set_text(s_bed_tgt, t);
-    set_bar_pct(s_bed_bar, st->bed_t * 100 / bed_max, 200);
-    set_bar_mark(s_bed_mark, st->bed_target * 100 / bed_max, 200, 20);
-
-    // 腔温 0 = 机型无腔温传感器(未上报),显示 -- 而非误导性的 0°
-    if (st->chamber_t > 0) snprintf(t, sizeof(t), "%d°", st->chamber_t);
-    else                   strcpy(t, "--");
-    lv_label_set_text(s_cham_cur, t);
-    set_bar_pct(s_cham_bar, st->chamber_t * 100 / 60, 200);   // 腔温量程 60℃
-
-    if (st->remain_min > 0) {
-        int h = st->remain_min / 60, m = st->remain_min % 60;
-        if (h > 0) snprintf(t, sizeof(t), "%dh%02dm", h, m);
-        else       snprintf(t, sizeof(t), "%dm", m);
-    } else {
-        strcpy(t, "--");
+    // Display order: the active (main) head is always 喷头1; the remaining
+    // heads follow in ascending protocol ID order. Reported IDs are sparse
+    // (an X2D can report 1,0,2,3), so raw IDs must never reach the label.
+    int order[4], shown = 0, active_idx = -1;
+    if (has_head) {
+        int reported = (int)st->heads.count;
+        if (reported > 4) reported = 4;
+        if (st->extruder.current_known) {
+            for (int k = 0; k < reported; k++)
+                if (st->heads.heads[k].id == st->extruder.current_id) { active_idx = k; break; }
+        }
+        int rest[4], rest_n = 0;
+        for (int k = 0; k < reported; k++)
+            if (k != active_idx) rest[rest_n++] = k;
+        for (int a = 0; a < rest_n; a++)
+            for (int b = a + 1; b < rest_n; b++)
+                if (st->heads.heads[rest[b]].id < st->heads.heads[rest[a]].id) {
+                    int swap = rest[a]; rest[a] = rest[b]; rest[b] = swap;
+                }
+        if (active_idx >= 0) order[shown++] = active_idx;
+        for (int a = 0; a < rest_n; a++) order[shown++] = rest[a];
     }
-    lv_label_set_text(s_temp_remain, t);
-}
+    if (!shown) { order[0] = 0; shown = 1; }
 
-// ------------------------------------------------------------ AMS 料槽页
+    for (int i = 0; i < 4; i++) {
+        bool show = i < shown;
+        lv_obj_set_hidden(s_head_compact[i], !show);
+        if (!show) continue;
+        char name[20] = "喷嘴";
+        char cv[8] = "--", tv[8] = "--";
+        bool ok = false;
+        if (has_head) {
+            const nozzle_head_t *head = &st->heads.heads[order[i]];
+            bool active = order[i] == active_idx;
+            ok = online && nozzle_head_temperature_fresh(head, now, SPIRIT_FRESH_MS);
+            int cur = head->temperature.current_c, target = head->temperature.target_c;
+            if (cur > 1000 || target > 1000) ok = false;
+            if (ok) {
+                snprintf(cv, sizeof(cv), "%d°", cur);
+                snprintf(tv, sizeof(tv), "%d°", target);
+            }
+            if (shown == 1) snprintf(name, sizeof(name), "%s", active ? "喷嘴 *" : "喷嘴");
+            else snprintf(name, sizeof(name), "%s喷头%d", active ? "*" : "", i + 1);
+        } else {
+            ok = online && app_telemetry_fresh(st->nozzle_valid, st->nozzle_ms, now);
+            bool target_ok = online && app_telemetry_fresh(st->nozzle_target_valid, st->nozzle_target_ms, now);
+            if (ok) snprintf(cv, sizeof(cv), "%d°", st->nozzle_t);
+            if (target_ok) snprintf(tv, sizeof(tv), "%d°", st->nozzle_target);
+        }
+        lv_label_set_text_fmt(s_head_compact[i], "%s  %s/%s", name, cv, tv);
+    }
+
+    char current[16] = "--", target[16] = "--";
+    if (online && app_telemetry_fresh(st->bed_valid, st->bed_ms, now)) snprintf(current, sizeof(current), "%d°", st->bed_t);
+    if (online && app_telemetry_fresh(st->bed_target_valid, st->bed_target_ms, now)) snprintf(target, sizeof(target), "%d°", st->bed_target);
+    lv_label_set_text_fmt(s_bed_value, "%s / %s", current, target);
+
+    // A1/A1 mini/A2L-class has no chamber; keep the row out of the page instead
+    // of spending a line on a permanent "--".
+    bool show_chamber = spirit_model_family(st->model) != 0;
+    lv_obj_set_hidden(s_chamber_lbl, !show_chamber);
+    lv_obj_set_hidden(s_chamber_value, !show_chamber);
+    if (online && app_telemetry_fresh(st->chamber_valid, st->chamber_ms, now)) lv_label_set_text_fmt(s_chamber_value, "%d°", st->chamber_t);
+    else lv_label_set_text(s_chamber_value, "--");
+}
 
 static void page_ams_build(lv_obj_t *p, int ams_idx)
 {
-    // 标题(刷新时更新台数/湿度)
-    s_ams_title[ams_idx] = label(p, &font_zh14, C_GREEN_L, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(s_ams_title[ams_idx], "耗材 · AMS");
-    lv_obj_align(s_ams_title[ams_idx], LV_ALIGN_TOP_MID, 0, 4);
-    // 副标题:当前在用槽的完整料名(卡片里只放得下材质简称)
-    s_ams_sub[ams_idx] = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(s_ams_sub[ams_idx], "在用 --");
-    lv_label_set_long_mode(s_ams_sub[ams_idx], LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(s_ams_sub[ams_idx], 220);
-    lv_obj_align(s_ams_sub[ams_idx], LV_ALIGN_TOP_MID, 0, 20);
-
-    // 2x2 料槽卡片(每张 100x98)
-    static const int GX[4] = { 14, 126 };
-    static const int GY[4] = { 44, 148 };
+    s_ams_title[ams_idx] = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_pos(s_ams_title[ams_idx], 10, 4); lv_obj_set_width(s_ams_title[ams_idx], 220);
+    // Character on top, a 2x2 material summary at the bottom. One compact line
+    // per slot (name + percent); the weight is intentionally dropped.
+    app_spirit_view_create(p, 64, 30);
     for (int i = 0; i < 4; i++) {
         int col = i % 2, row = i / 2;
-        int x = GX[col], y = GY[row];
-        card(p, x, y, 100, 98, C_PANEL2);
-
-        s_ams_swatch[ams_idx][i] = rect(p, x + 9, y + 8, 58, 52, 0x141C26);
-        lv_obj_set_style_radius(s_ams_swatch[ams_idx][i], 6, 0);
-        lv_obj_set_style_border_width(s_ams_swatch[ams_idx][i], 2, 0);
-        lv_obj_set_style_border_color(s_ams_swatch[ams_idx][i], lv_color_hex(C_LINE), 0);
-
-        // 右侧余量竖条(满量程 1000g),填充自底向上
-        lv_obj_t *track = rect(p, x + 73, y + 8, 12, 52, C_LINE);
-        lv_obj_set_style_radius(track, 3, 0);
-        s_ams_gauge[ams_idx][i] = rect(track, 0, 0, 12, 0, C_GREEN_L);
-        lv_obj_set_style_radius(s_ams_gauge[ams_idx][i], 3, 0);
-        lv_obj_align(s_ams_gauge[ams_idx][i], LV_ALIGN_BOTTOM_MID, 0, 0);
-
+        int x = 14 + col * 114;
+        int y = 190 + row * 24;
+        s_ams_swatch[ams_idx][i] = rect(p, x, y + 3, 12, 12, C_LINE);
         s_ams_type[ams_idx][i] = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_pos(s_ams_type[ams_idx][i], x + 18, y); lv_obj_set_width(s_ams_type[ams_idx][i], 58);
         lv_label_set_long_mode(s_ams_type[ams_idx][i], LV_LABEL_LONG_DOT);
-        lv_obj_set_width(s_ams_type[ams_idx][i], 84);   // 材质/料名过长省略号截断
-        lv_obj_align(s_ams_type[ams_idx][i], LV_ALIGN_TOP_LEFT, x + 9, y + 64);
-
-        s_ams_remain[ams_idx][i] = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-        lv_obj_align(s_ams_remain[ams_idx][i], LV_ALIGN_TOP_LEFT, x + 9, y + 82);
-
-        // 活动标记(色块右上角绿点)
-        s_ams_mark[ams_idx][i] = rect(p, x + 60, y + 2, 8, 8, C_GREEN);
-        lv_obj_set_style_radius(s_ams_mark[ams_idx][i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_add_flag(s_ams_mark[ams_idx][i], LV_OBJ_FLAG_HIDDEN);
+        s_ams_remain[ams_idx][i] = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_RIGHT);
+        lv_obj_set_pos(s_ams_remain[ams_idx][i], x + 78, y); lv_obj_set_width(s_ams_remain[ams_idx][i], 30);
     }
 }
 
 static void refresh_ams(const bambu_state_t *st, int ams_idx, int total_ams)
 {
+    (void)total_ams;
     const bambu_ams_t *a = &st->ams[ams_idx];
-    char t[64];
-
-    if (!a->present) {
-        // 外部料筒
-        lv_label_set_text(s_ams_title[ams_idx], "外部料筒");
-    } else {
-        if (a->humidity_raw > 0 && a->temp > 0)
-            snprintf(t, sizeof(t), "AMS %d · %d台 · 湿%d%% · %d°",
-                     ams_idx + 1, total_ams, a->humidity_raw, a->temp);
-        else if (a->temp > 0)
-            snprintf(t, sizeof(t), "AMS %d · %d台 · 干燥%d · %d°",
-                     ams_idx + 1, total_ams,
-                     a->humidity >= 0 ? a->humidity : 0, a->temp);
-        else
-            snprintf(t, sizeof(t), "AMS %d · %d台 · 干燥%d",
-                     ams_idx + 1, total_ams,
-                     a->humidity >= 0 ? a->humidity : 0);
-        lv_label_set_text(s_ams_title[ams_idx], t);
-    }
-
-    // 副标题:卡片里只有 6 个字的空间,完整料名放这里
-    char sub[56];
-    const char *active_name = NULL;
+    uint64_t now = spirit_now_ms(); bool online = st->cloud == BAMBU_CLOUD_ONLINE;
+    bool humidity_fresh = online && app_telemetry_fresh(a->present, a->humidity_updated_ms, now);
+    bool raw_fresh = online && app_telemetry_fresh(a->present, a->humidity_raw_updated_ms, now);
+    char humidity[32] = "湿度 --";
+    if (raw_fresh && a->humidity_raw >= 0) snprintf(humidity, sizeof(humidity), "湿度 %d%%", a->humidity_raw);
+    else if (humidity_fresh && a->humidity > 0) snprintf(humidity, sizeof(humidity), "湿度档 %d", a->humidity);
+    if (a->present) lv_label_set_text_fmt(s_ams_title[ams_idx], "AMS %u · %s", a->id + 1, humidity);
+    else lv_label_set_text(s_ams_title[ams_idx], "外部料筒");
     for (int i = 0; i < 4; i++) {
-        if (a->tray[i].active && a->tray[i].is_used) {
-            // 手动耗材没有 tray_id_name,退回材质名(如 PLA),别显示空的"在用 "
-            active_name = a->tray[i].tray_name[0] ? a->tray[i].tray_name
-                                                  : a->tray[i].tray_type;
-            break;
-        }
+        const bambu_tray_t *t = &a->tray[i];
+        bool visible = a->present || i == 0;
+        lv_obj_set_hidden(s_ams_swatch[ams_idx][i], !visible);
+        lv_obj_set_hidden(s_ams_type[ams_idx][i], !visible);
+        lv_obj_set_hidden(s_ams_remain[ams_idx][i], !visible);
+        bool fresh = online && app_telemetry_fresh(t->reported, t->updated_ms, now);
+        const char *name = t->tray_type[0] ? t->tray_type : t->tray_name[0] ? t->tray_name : t->is_used ? "耗材" : "空槽";
+        lv_label_set_text_fmt(s_ams_type[ams_idx][i], "%s%d %s", t->active ? "*" : "", i + 1, fresh ? name : "--");
+        lv_obj_set_style_bg_color(s_ams_swatch[ams_idx][i], lv_color_hex(fresh && t->color_valid ? t->tray_color : C_LINE), 0);
+        bool pct_fresh = fresh && app_telemetry_fresh(t->pct_valid, t->pct_updated_ms, now);
+        if (pct_fresh) lv_label_set_text_fmt(s_ams_remain[ams_idx][i], "%d%%", t->tray_pct);
+        else lv_label_set_text(s_ams_remain[ams_idx][i], "--");
     }
-    if (active_name && active_name[0]) snprintf(sub, sizeof(sub), "在用 %s", active_name);
-    else if (!a->present)              snprintf(sub, sizeof(sub), "外部料筒 · 无 AMS 数据");
-    else                               snprintf(sub, sizeof(sub), "在用 --");
-    lv_label_set_text(s_ams_sub[ams_idx], sub);
-
-    for (int i = 0; i < 4; i++) {
-        const bambu_tray_t *slot = &a->tray[i];
-        bool used = slot->is_used;
-        // 色块(color_valid 区分"无色"与纯黑,纯黑料显示真黑色)
-        uint32_t swc = used ? (slot->color_valid ? slot->tray_color : 0x22303F)
-                            : 0x141C26;
-        lv_obj_set_style_bg_color(s_ams_swatch[ams_idx][i], lv_color_hex(swc), 0);
-        // 活动槽高亮边框
-        uint32_t bcol = slot->active ? C_GREEN_L : C_LINE;
-        lv_obj_set_style_border_color(s_ams_swatch[ams_idx][i], lv_color_hex(bcol), 0);
-        // 活动标记(右上角绿点)
-        if (slot->active) lv_obj_remove_flag(s_ams_mark[ams_idx][i], LV_OBJ_FLAG_HIDDEN);
-        else              lv_obj_add_flag(s_ams_mark[ams_idx][i], LV_OBJ_FLAG_HIDDEN);
-
-        // 有 tray_type 显示材质(PLA/PETG);X2D/AMS2 只有 tray_name(料名),用青色区分
-        const char *label_txt = "-";
-        if (used)
-            label_txt = slot->tray_type[0] ? slot->tray_type : slot->tray_name;
-        lv_label_set_text(s_ams_type[ams_idx][i], label_txt);
-        lv_obj_set_style_text_color(s_ams_type[ams_idx][i],
-            lv_color_hex(slot->tray_type[0] ? C_TEXT : C_CYAN), 0);
-        if (used) {
-            // 有余量数据 → 克数(整卷克数 × 剩余百分比);整卷克数未知 → 百分比;
-            // 手动耗材/无 RFID 料卷 remain=-1 → 余量未知显示 "--"(材质与颜色照常显示)
-            if (slot->tray_pct >= 0)
-                snprintf(t, sizeof(t), slot->tray_weight > 0 ? "%dg" : "%d%%",
-                         slot->tray_weight > 0 ? slot->tray_remain : slot->tray_pct);
-            else
-                strcpy(t, "--");
-        } else {
-            strcpy(t, "空槽");
-        }
-        lv_label_set_text(s_ams_remain[ams_idx][i], t);
-
-        // 余量竖条按整卷百分比(0~100)填充:250g 小卷半满也显示半格,
-        // 不会像按"克/1000"那样几乎全空。低于 20% 转黄提醒。
-        int p = slot->tray_pct;
-        int gh = (p > 0) ? (p > 100 ? 52 : p * 52 / 100) : 0;
-        lv_obj_set_height(s_ams_gauge[ams_idx][i], gh);
-        lv_obj_align(s_ams_gauge[ams_idx][i], LV_ALIGN_BOTTOM_MID, 0, 0);
-        lv_obj_set_style_bg_color(s_ams_gauge[ams_idx][i],
-            lv_color_hex(p > 20 ? C_GREEN_L : (p > 0 ? C_YELLOW : C_LINE)), 0);
-    }
-}
-
-// ------------------------------------------------------------ 设备页
-
-static void device_line(lv_obj_t *p, int y, const char *k, lv_obj_t **val)
-{
-    lv_obj_t *kl = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(kl, k);
-    lv_obj_align(kl, LV_ALIGN_TOP_LEFT, 14, y);
-    *val = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_RIGHT);
-    lv_obj_align(*val, LV_ALIGN_TOP_RIGHT, -14, y);
 }
 
 static void page_device_build(lv_obj_t *p)
 {
-    device_line(p, 6,  "打印机", &s_d_sn);
-    device_line(p, 30, "打印机WiFi", &s_d_rssi);
-    device_line(p, 54, "打印机IP", &s_d_ip);
-    device_line(p, 78, "云连接", &s_d_cloud);
-    device_line(p, 102,"在线时长", &s_d_uptime);
-    // WiFi 名单独一行(左侧标签占 70px,值区限宽 136px,超长末尾省略),
-    // 信号强度另起一行:两者挤一行时中文 SSID 会长到压住下一行。
-    device_line(p, 126,"通行证WiFi", &s_d_wifi);
-    lv_obj_set_width(s_d_wifi, 136);
-    lv_label_set_long_mode(s_d_wifi, LV_LABEL_LONG_DOT);
-    device_line(p, 150,"信号强度", &s_d_wifi_rssi);
-
-    // HMS 告警面板
-    s_d_hms_panel = rect(p, 10, 170, 220, 72, 0x1A1418);
-    lv_obj_set_style_radius(s_d_hms_panel, 6, 0);
-    lv_obj_set_style_border_width(s_d_hms_panel, 1, 0);
-    lv_obj_set_style_border_color(s_d_hms_panel, lv_color_hex(0x3A2226), 0);
-    s_d_hms_lbl = label(s_d_hms_panel, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(s_d_hms_lbl, "告警:无");
-    lv_obj_align(s_d_hms_lbl, LV_ALIGN_TOP_LEFT, 8, 6);
-    lv_label_set_long_mode(s_d_hms_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_d_hms_lbl, 204);
-
-    // 固件版本(底部固定)
-    lv_obj_t *ver = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text_fmt(ver, APP_PRODUCT_NAME " v%s", FW_VERSION);
-    lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -2);
+    s_d_model = label(p, &font_zh20, C_TEXT, LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_pos(s_d_model, 10, 2); lv_obj_set_width(s_d_model, 220);
+    app_spirit_view_create(p, 64, 26);
+    s_d_cloud = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_d_cloud, 14, 152); lv_obj_set_width(s_d_cloud, 140);
+    for (int i = 0; i < 4; i++) {
+        int h = 4 + i * 3;
+        s_sig_bar[i] = rect(p, 158 + i * 5, 168 - h, 3, h, C_LINE);
+    }
+    s_d_wifi = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_set_pos(s_d_wifi, 176, 152); lv_obj_set_width(s_d_wifi, 60);
+    s_d_sn = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_d_sn, 14, 174); lv_obj_set_width(s_d_sn, 212);
+    lv_label_set_long_mode(s_d_sn, LV_LABEL_LONG_DOT);
+    s_d_ip = label(p, &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_d_ip, 14, 194); lv_obj_set_width(s_d_ip, 212);
+    rect(p, 14, 210, 212, 1, C_LINE);
+    s_d_hms_lbl = label(p, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_d_hms_lbl, 14, 214); lv_obj_set_size(s_d_hms_lbl, 212, 18);
+    lv_label_set_long_mode(s_d_hms_lbl, LV_LABEL_LONG_DOT);
 }
 
 static void refresh_device(const bambu_state_t *st)
 {
-    char t[40];
-    lv_label_set_text(s_d_sn, app_mqtt_sn(s_midx));
-    snprintf(t, sizeof(t), "%d dBm", st->wifi_signal);
-    lv_label_set_text(s_d_rssi, t);
-
+    lv_label_set_text(s_d_model, st->model[0] ? st->model : "机型未上报");
+    lv_label_set_text_fmt(s_d_sn, "SN %s", app_mqtt_sn(s_midx));
+    const char *cloud = st->cloud == BAMBU_CLOUD_ONLINE   ? "云端已连接"
+                      : st->cloud == BAMBU_CLOUD_CONNECTING ? "云端连接中" : "云端离线";
+    lv_label_set_text(s_d_cloud, cloud);
+    int rssi = app_wifi_connected() ? app_wifi_rssi() : -127;
+    int bars = rssi >= -55 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : rssi >= -85 ? 1 : 0;
+    for (int i = 0; i < 4; i++)
+        lv_obj_set_style_bg_color(s_sig_bar[i], lv_color_hex(i < bars ? C_GREEN : C_LINE), 0);
+    if (app_wifi_connected()) lv_label_set_text_fmt(s_d_wifi, "%d dBm", rssi);
+    else lv_label_set_text(s_d_wifi, "未连接");
     if (st->printer_ip) {
-        uint8_t *b = (uint8_t *)&st->printer_ip;
-        snprintf(t, sizeof(t), "%u.%u.%u.%u", b[3], b[2], b[1], b[0]);
-    } else {
-        strcpy(t, "-");
-    }
-    lv_label_set_text(s_d_ip, t);
-
-    switch (st->cloud) {
-    case BAMBU_CLOUD_ONLINE:
-        strcpy(t, "已连接");
-        lv_obj_set_style_text_color(s_d_cloud, lv_color_hex(C_GREEN_L), 0);
-        break;
-    case BAMBU_CLOUD_CONNECTING:
-        strcpy(t, "连接中");
-        lv_obj_set_style_text_color(s_d_cloud, lv_color_hex(C_YELLOW), 0);
-        break;
-    default:
-        strcpy(t, "离线");
-        lv_obj_set_style_text_color(s_d_cloud, lv_color_hex(C_DIM), 0);
-        break;
-    }
-    lv_label_set_text(s_d_cloud, t);
-
-    int up = app_mqtt_uptime_sec();
-    if (up >= 3600) snprintf(t, sizeof(t), "%dh%02dm", up / 3600, (up % 3600) / 60);
-    else             snprintf(t, sizeof(t), "%dm%02ds", up / 60, up % 60);
-    lv_label_set_text(s_d_uptime, t);
-
-    // 实际关联的 WiFi 名(不是存档里"打算连"的),出门自动切换后可直接确认。
-    // 名字与信号强度分两行显示,避免长 SSID 压到下一行。
-    const char *wifi_ssid = app_wifi_current_ssid();
-    lv_label_set_text(s_d_wifi, wifi_ssid ? wifi_ssid : "未连接");
-    if (wifi_ssid) snprintf(t, sizeof(t), "%d dBm", app_wifi_rssi());
-    else           strcpy(t, "-");
-    lv_label_set_text(s_d_wifi_rssi, t);
-
-    // HMS 告警面板
-    if (st->hms_count > 0) {
-        snprintf(t, sizeof(t), "告警 %d 条", st->hms_count);
-        for (int i = 0; i < st->hms_count; i++) {
-            char one[MSG_MAX];
-            const char *txt = hms_lookup(st->hms[i].code, one, sizeof(one));
-            if (strlen(t) + strlen(txt) + 4 < sizeof(t)) {
-                strcat(t, "\n");
-                strcat(t, txt);
-            }
-        }
-        lv_label_set_text(s_d_hms_lbl, t);
-        lv_obj_set_style_bg_color(s_d_hms_panel, lv_color_hex(
-            (st->gcode_state[0] && !strcmp(st->gcode_state, "PAUSE")) ? 0x1A180D : 0x1A1418), 0);
-    } else {
-        lv_label_set_text(s_d_hms_lbl, "告警:无");
-        lv_obj_set_style_bg_color(s_d_hms_panel, lv_color_hex(0x141C18), 0);
-    }
+        const uint8_t *ip = (const uint8_t *)&st->printer_ip;
+        lv_label_set_text_fmt(s_d_ip, "IP %u.%u.%u.%u", ip[3], ip[2], ip[1], ip[0]);
+    } else lv_label_set_text(s_d_ip, "IP --");
+    spirit_status_t status = spirit_status(st);
+    if (!spirit_status_fresh(&status, spirit_now_ms())) lv_label_set_text(s_d_hms_lbl, "等待最新设备数据");
+    else if (st->hms_count) {
+        char text[MSG_MAX]; lv_label_set_text(s_d_hms_lbl, hms_lookup(st->hms[0].code, text, sizeof(text)));
+    } else if (!strcmp(st->gcode_state, "PAUSE")) lv_label_set_text(s_d_hms_lbl, "暂停原因未上报，请检查打印机");
+    else lv_label_set_text(s_d_hms_lbl, "暂无告警");
 }
 
 // ------------------------------------------------------------ 刷新
@@ -845,72 +855,135 @@ static void refresh_header(const bambu_state_t *st)
 
 static void refresh_all(void)
 {
+    // Observe every configured printer, including while its detail is hidden.
+    uint64_t event_now = spirit_now_ms();
+    app_spirit_bindings_poll();
+    for (int machine = 0; machine < app_mqtt_machine_count(); machine++) {
+        app_mqtt_snapshot(machine, &s_work);
+        spirit_status_t event_status = spirit_status(&s_work);
+        bool fresh = spirit_status_fresh(&event_status, event_now);
+        spirit_action_t action = spirit_action_for_status(&event_status, event_now);
+        if (s_event_fresh[machine] != fresh || (fresh && (!s_events[machine].initialized || s_events[machine].generation != event_status.job_generation))) app_notify_epoch(machine);
+        s_event_fresh[machine] = fresh;
+        bool old_finish = app_spirit_finish_saved(machine, event_status.task_token, NULL);
+        int kind = spirit_event_observe(&s_events[machine], &event_status, event_status.task_token, old_finish, event_now);
+        if (kind >= 0) {
+            unsigned skin = app_spirit_skin_for_machine(machine);
+            app_notify_voice(machine, skin, (unsigned)kind);
+            // Screen-level bubble: visible on whichever detail page is open.
+            if (s_active && !s_ov_mode && s_midx == machine) {
+                const char *text = app_notify_voice_text(skin, (unsigned)kind);
+                if (text) bubble_show(text, true);
+            }
+        }
+        if (fresh && action == SPIRIT_COMPLETED) app_spirit_finish_remember(machine, event_status.task_token, false);
+    }
+    app_notify_poll();
     // 概览列表模式:只刷列表卡片,不动详情页
     if (s_ov_mode) {
+        if (s_bubble) lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+        s_bubble_until_ms = 0;
+        s_bubble_sticky = false;
         ov_refresh();
+        s_midx = s_report_machine;
+        app_mqtt_snapshot(s_report_machine, &s_work);
+        refresh_header(&s_work);
+        refresh_status_bar(&s_work);
+        // Page dots belong to detail navigation, not to the printer list.
+        for (int i = 0; i < PAGE_MAX; i++) lv_obj_set_hidden(s_dots[i], true);
         return;
     }
-    bambu_state_t st;
-    app_mqtt_snapshot(s_midx, &st);
+    app_mqtt_snapshot(s_midx, &s_work);
+    const bambu_state_t *current = &s_work;
+#define st (*current)
+    uint64_t now_ms = spirit_now_ms();
+    spirit_status_t status = spirit_status(&st);
 
-    // 脏检查:快照没变、无交互时只刷头部(时钟/电量/页点),不重排整页
-    bool changed = !s_prev_valid || memcmp(&s_prev, &st, sizeof(st)) != 0;
-    if (changed) { s_prev = st; s_prev_valid = true; }
-
-    // 动态页数:2 固定 + AMS 台数;已收到数据但 ams_count=0(外部料筒)也保留 1 页
-    int ams_pages = st.ams_count;
-    if (ams_pages > 4) ams_pages = 4;
-    if (ams_pages == 0 && st.gcode_state[0]) ams_pages = 1;
-    ensure_ams_pages(ams_pages);   // 只建用得到的 AMS 页,省 LVGL 池(新建页默认隐藏)
-    // 导航序 → 实体槽位:进度/温度固定,AMS 只取前 ams_pages 个,设备固定 6
-    {
-        int n = 0;
-        s_slot[n++] = 0;
-        s_slot[n++] = 1;
-        for (int i = 0; i < ams_pages; i++) s_slot[n++] = 2 + i;
-        s_slot[n++] = 6;                 // 设备页实体
-        s_pages_n = n;                   // = 2 + ams + 设备
+    // The screen sleeps after 30s and stops LVGL timers. On wake, greet with
+    // the current state instead of leaving the user with a silent black screen.
+    bool resumed = s_last_refresh_ms && now_ms > s_last_refresh_ms + 15000ULL;
+    s_last_refresh_ms = now_ms;
+    if (resumed) {
+        s_chatter_seen = false;
+        s_chatter_ms = now_ms;
+        if (spirit_status_fresh(&status, now_ms)) {
+            int kind = voice_kind_for_action(spirit_action_for_status(&status, now_ms));
+            const char *text = kind >= 0 ? app_notify_voice_text(app_spirit_skin_for_machine(s_midx), (unsigned)kind) : NULL;
+            if (text) bubble_show(text, true);
+        }
     }
-    if (s_cur >= s_pages_n) s_cur = s_pages_n - 1;
-    if (s_cur < 0) s_cur = 0;
-    apply_page_vis(s_slot[s_cur]);       // 懒建页后重新收敛可见性(只留当前页)
-    int dev_idx = 2 + ams_pages;
+
+    int previous_slot = s_cur >= 0 && s_cur < s_pages_n ? s_slot[s_cur] : 0;
+    int ams_pages = st.ams_count > 0 ? st.ams_count : 1;
+    if (ams_pages > 4) ams_pages = 4;
+    int temp_pages = 1; // 1-4 nozzles share one compact page; no pager
+    int n = 0; s_slot[n++] = 0;
+    for (int i = 0; i < temp_pages; i++) s_slot[n++] = 1 + i;
+    for (int i = 0; i < ams_pages; i++) s_slot[n++] = 5 + i;
+    s_slot[n++] = 9; s_pages_n = n;
+    for (int i = 0; i < n; i++) if (s_slot[i] == previous_slot) { s_cur = i; break; }
+    if (s_cur >= n) s_cur = n - 1;
+    apply_page_vis(s_slot[s_cur]);
+    int slot = s_slot[s_cur];
+    s_temperature_pair = slot >= 1 && slot <= 4 ? slot - 1 : 0;
+    app_spirit_view_context(st.model, slot >= 1 && slot <= 4 ? 6 : slot >= 5 && slot <= 8 ? 7 : -1, now_ms);
+    app_spirit_view_update(s_midx, &status, now_ms);
 
     refresh_header(&st);
-    if (!changed && !s_dirty) return;
-    s_dirty = false;
-
-    // 状态切换提示音(完成/失败/暂停)
-    if (s_last_state[0] && strcmp(s_last_state, st.gcode_state)) {
-        if (!strcmp(st.gcode_state, "FINISH"))  app_notify_trigger(NOTIFY_FINISH);
-        else if (!strcmp(st.gcode_state, "FAILED")) app_notify_trigger(NOTIFY_FAIL);
-        else if (!strcmp(st.gcode_state, "PAUSE"))  app_notify_trigger(NOTIFY_PAUSE);
-    }
-    strlcpy(s_last_state, st.gcode_state[0] ? st.gcode_state : "IDLE", sizeof(s_last_state));
-
+    // Individual telemetry fields can expire while gcode_state stays fresh.
+    // Refresh the one visible page once per tick; LVGL skips equal label text.
     refresh_status_bar(&st);
 
-    switch (s_cur) {
-    case 0: refresh_progress(&st); break;
-    case 1: refresh_temp(&st); break;
-    default:
-        if (s_cur >= 2 && s_cur < dev_idx) refresh_ams(&st, s_cur - 2, ams_pages);
-        else if (s_cur == dev_idx)         refresh_device(&st);
-        break;
-    }
+    if (slot == 0) refresh_progress(&st);
+    else if (slot <= 4) refresh_temp(&st);
+    else if (slot <= 8) refresh_ams(&st, slot - 5, ams_pages);
+    else refresh_device(&st);
 
+    refresh_bubble(now_ms);
+
+    // Low-frequency text-only chatter on the progress page. It never asks the
+    // audio worker to play; event voices remain tied to state transitions.
+    spirit_action_t chatter_action = spirit_action_for_status(&status, now_ms);
+    bool chatter_idle = chatter_action == SPIRIT_IDLE ||
+                        (chatter_action == SPIRIT_COMPLETED && app_spirit_view_finish_acknowledged(s_midx));
+    uint64_t chatter_wait = s_chatter_seen ? CHATTER_PERIOD_MS : CHATTER_FIRST_MS;
+    if (slot == 0 && spirit_status_fresh(&status, now_ms) &&
+        (chatter_action == SPIRIT_PRINTING || chatter_idle) &&
+        now_ms >= s_chatter_ms + chatter_wait && now_ms >= s_bubble_until_ms &&
+        !app_notify_busy()) {
+        s_chatter_seen = true;
+        s_chatter_ms = now_ms;
+        bubble_show(chatter_text(app_spirit_skin_for_machine(s_midx), chatter_action, &st, now_ms), false);
+    }
+#undef st
 }
+
 
 static void tick_1s(lv_timer_t *t)
 {
     (void)t;
-    if (s_active) refresh_all();
+    if (s_active) {
+        refresh_all();
+        static uint64_t last_budget_ms;
+        uint64_t now_ms = spirit_now_ms();
+        if (now_ms - last_budget_ms >= 60000) {
+            app_spirit_view_log_budget("periodic");
+            last_budget_ms = now_ms;
+        }
+    }
 }
 
 static void tick_once(lv_timer_t *t)
 {
+    if (t == s_retry) s_retry = NULL;
     lv_timer_delete(t);
     if (s_active) refresh_all();
+}
+
+static void schedule_retry(void)
+{
+    if (s_retry) lv_timer_delete(s_retry);
+    s_retry = lv_timer_create(tick_once, 1500, NULL);
 }
 
 // ------------------------------------------------------------ 机器概览实现
@@ -919,114 +992,97 @@ static void tick_once(lv_timer_t *t)
 
 static void ov_build(void)
 {
-    s_ov_page = lv_obj_create(s_scr);
-    lv_obj_remove_flag(s_ov_page, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_ov_page, 0, PAGE_Y);
-    lv_obj_set_size(s_ov_page, 240, PAGE_H);
-    lv_obj_set_style_bg_opa(s_ov_page, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_ov_page, 0, 0);
-    lv_obj_set_style_pad_all(s_ov_page, 0, 0);
-
+    s_ov_page = page_new();
+    lv_obj_set_hidden(s_ov_page, false);
+    app_spirit_view_create(s_ov_page, 6, 22);
+    s_report_name = label(s_ov_page, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_report_name, 122, 10); lv_obj_set_size(s_report_name, 106, 36);
+    lv_label_set_long_mode(s_report_name, LV_LABEL_LONG_DOT);
+    s_report_value = label(s_ov_page, &lv_font_montserrat_36, C_GREEN_L, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_report_value, 120, 54);
+    s_report_line = label(s_ov_page, &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_pos(s_report_line, 122, 102); lv_obj_set_size(s_report_line, 106, 52);
+    lv_label_set_long_mode(s_report_line, LV_LABEL_LONG_WRAP);
     int n = app_mqtt_machine_count();
-    if (n < 1) n = 1;
-    if (n > BAMBU_MACHINE_MAX) n = BAMBU_MACHINE_MAX;
-
-    // 分档布局:卡高/间距按机器数取,整体宽松不挤
-    int card_h, gap, top = 10;
-    if (n <= 2)      { card_h = 110; gap = 12; }
-    else if (n == 3) { card_h = 72;  gap = 10; }
-    else             { card_h = 55;  gap = 7;  }
-    s_ov_bar_w = (n <= 2) ? 196 : (n == 3 ? 190 : 184);
-
-    for (int i = 0; i < n; i++) {
-        int y = top + i * (card_h + gap);
-        s_ov_card[i] = card(s_ov_page, 8, y, 224, card_h, C_PANEL2);
-        // 状态点 + 名称
-        s_ov_dot[i] = rect(s_ov_card[i], 12, 10, 8, 8, C_DIM);
-        lv_obj_set_style_radius(s_ov_dot[i], 4, 0);
-        s_ov_name[i] = label(s_ov_card[i], &font_zh14, C_TEXT, LV_TEXT_ALIGN_LEFT);
-        lv_obj_set_pos(s_ov_name[i], 26, 3);
-        lv_obj_set_width(s_ov_name[i], 120);
+    for (int i = 0; i < n && i < BAMBU_MACHINE_MAX; i++) {
+        s_ov_card[i] = rect(s_ov_page, 8, 172 + i * 23, 224, 22, C_BG);
+        s_ov_name[i] = label(s_ov_card[i], &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_pos(s_ov_name[i], 4, 2); lv_obj_set_width(s_ov_name[i], 146);
         lv_label_set_long_mode(s_ov_name[i], LV_LABEL_LONG_DOT);
-        // 进度%(右上)
-        s_ov_pct[i] = label(s_ov_card[i], (n <= 2) ? &font_zh20 : &font_zh14,
-                            C_GREEN, LV_TEXT_ALIGN_RIGHT);
-        lv_obj_set_pos(s_ov_pct[i], 132, 1);
-        lv_obj_set_width(s_ov_pct[i], 80);
-        // 进度条
-        int bar_y = (n <= 2) ? 56 : (n == 3 ? 30 : 26);
-        lv_obj_t *trk = rect(s_ov_card[i], 12, bar_y, s_ov_bar_w, 6, C_LINE);
-        lv_obj_set_style_radius(trk, 3, 0);
-        s_ov_bar[i] = rect(s_ov_card[i], 12, bar_y, 0, 6, C_GREEN);
-        lv_obj_set_style_radius(s_ov_bar[i], 3, 0);
-        // 状态 + 剩余(左下)
-        s_ov_state[i] = label(s_ov_card[i], &font_zh14, C_DIM, LV_TEXT_ALIGN_LEFT);
-        lv_obj_set_pos(s_ov_state[i], 12, bar_y + 12);
-        lv_obj_set_width(s_ov_state[i], 200);
-        lv_label_set_long_mode(s_ov_state[i], LV_LABEL_LONG_DOT);
+        s_ov_pct[i] = label(s_ov_card[i], &font_zh14, C_TEXT, LV_TEXT_ALIGN_RIGHT);
+        lv_obj_set_pos(s_ov_pct[i], 150, 2); lv_obj_set_width(s_ov_pct[i], 68);
     }
-    lv_obj_add_flag(s_ov_page, LV_OBJ_FLAG_HIDDEN);
+    app_spirit_view_set_visible(true);
 }
 
 // 状态文字与颜色:RUNNING=打印中/PAUSE=已暂停/FINISH=已完成/FAILED=失败/IDLE=空闲
 static uint32_t ov_state_text(const bambu_state_t *st, char *out, int n)
 {
-    if (st->hms_count > 0) {
-        snprintf(out, n, "HMS 告警");
-        return C_RED;
+    spirit_status_t status = spirit_status(st);
+    if (!spirit_status_fresh(&status, spirit_now_ms())) {
+        snprintf(out,n,"%s",st->cloud == BAMBU_CLOUD_CONNECTING ? "连接中" : st->cloud != BAMBU_CLOUD_ONLINE ? "离线" : !st->state_received ? "未上报" : "数据过期"); return C_YELLOW;
     }
-    const char *s = st->gcode_state;
-    if (!strcmp(s, "RUNNING")) {
-        snprintf(out, n, "打印中 · 剩 %d时%d分", st->remain_min / 60, st->remain_min % 60);
-        return C_GREEN;
-    }
-    if (!strcmp(s, "PAUSE"))  { snprintf(out, n, "已暂停"); return C_YELLOW; }
-    if (!strcmp(s, "FINISH")) { snprintf(out, n, "已完成"); return C_CYAN; }
-    if (!strcmp(s, "FAILED")) { snprintf(out, n, "失败");   return C_RED; }
-    snprintf(out, n, "空闲 · 等待任务");
-    return C_DIM;
+    uint32_t color;
+    const char *text = spirit_action_for_status(&status,spirit_now_ms()) == SPIRIT_RUNOUT ? "缺料" : state_zh(st->gcode_state,&color);
+    if (!strcmp(text,"缺料")) color = C_YELLOW;
+    snprintf(out,n,"%s",text); return color;
 }
 
 static void ov_refresh(void)
 {
-    int n = app_mqtt_machine_count();
-    if (n < 1) n = 1;
-    if (n > BAMBU_MACHINE_MAX) n = BAMBU_MACHINE_MAX;
-
+    int n = app_mqtt_machine_count(); if (n > BAMBU_MACHINE_MAX) n = BAMBU_MACHINE_MAX;
+    uint64_t now = spirit_now_ms();
     for (int i = 0; i < n; i++) {
-        bambu_state_t st;
-        app_mqtt_snapshot(i, &st);
-
-        // 名称:自定义名优先,否则"N号机";右侧再带 #尾4 便于区分
-        char nm[40];
-        const char *cust = app_mqtt_name(i);
-        const char *snv = app_mqtt_sn(i);
-        int selen = snv ? (int)strlen(snv) : 0;
-        const char *tail = (selen >= 4) ? snv + selen - 4 : (snv ? snv : "");
-        if (cust && cust[0]) snprintf(nm, sizeof(nm), "%s #%s", cust, tail);
-        else                 snprintf(nm, sizeof(nm), "%d号机 #%s", i + 1, tail);
-        lv_label_set_text(s_ov_name[i], nm);
-
-        // 状态与进度
-        char txt[48];
-        uint32_t col = ov_state_text(&st, txt, sizeof(txt));
-        lv_label_set_text(s_ov_state[i], txt);
-        lv_obj_set_style_text_color(s_ov_state[i], lv_color_hex(col), 0);
-        lv_obj_set_style_bg_color(s_ov_dot[i], lv_color_hex(col), 0);
-        if (st.pct > 0) {
-            lv_label_set_text_fmt(s_ov_pct[i], "%d%%", st.pct);
-            lv_obj_set_width(s_ov_bar[i], s_ov_bar_w * st.pct / 100);
-        } else {
-            lv_label_set_text(s_ov_pct[i], "--");
-            lv_obj_set_width(s_ov_bar[i], 0);
-        }
-
-        // 选中高亮(绿框),HMS 机器红框
-        bool sel = (i == s_ov_sel);
-        uint32_t border = sel ? C_GREEN : (st.hms_count > 0 ? C_RED : C_LINE);
-        lv_obj_set_style_border_width(s_ov_card[i], sel ? 2 : 1, 0);
-        lv_obj_set_style_border_color(s_ov_card[i], lv_color_hex(border), 0);
+        app_mqtt_snapshot(i,&s_work);
+        s_dispatch_status[i].status = spirit_status(&s_work);
+        // gcode_state is borrowed from the scratch snapshot; retain a small copy.
+        memcpy(s_dispatch_states[i],s_work.gcode_state,sizeof(s_work.gcode_state));
+        s_dispatch_status[i].status.gcode_state = s_dispatch_states[i];
+        s_dispatch_status[i].hms = s_work.hms_count > 0;
+        const char *name = app_mqtt_name(i);
+        lv_label_set_text_fmt(s_ov_name[i],"%s %s",name ? name : app_mqtt_sn(i),app_spirit_skin_name(app_spirit_skin_for_machine(i)));
+        char text[32]; uint32_t color = ov_state_text(&s_work,text,sizeof(text));
+        bool fresh = spirit_status_fresh(&s_dispatch_status[i].status,now);
+        if (fresh && !strcmp(s_work.gcode_state,"RUNNING") && app_telemetry_fresh(s_work.pct_valid,s_work.pct_ms,now)) lv_label_set_text_fmt(s_ov_pct[i],"%d%%",s_work.pct);
+        else lv_label_set_text(s_ov_pct[i],text);
+        lv_obj_set_style_text_color(s_ov_pct[i],lv_color_hex(color),0);
+        lv_obj_set_style_bg_color(s_ov_card[i],lv_color_hex(i == s_ov_sel ? C_PANEL2 : C_BG),0);
     }
+    int selected = spirit_dispatch_choose(&s_dispatch,s_dispatch_status,(size_t)n,now);
+    if (selected < 0) return;
+    bool reply = false;
+    // An idle partner answers only during a normal printing report; exceptions
+    // never lose focus to chatter. The detail target is unaffected.
+    if (s_dispatch.priority == 0 && now - s_dispatch.since_ms >= 4000 &&
+        spirit_action_for_status(&s_dispatch_status[selected].status,now) == SPIRIT_PRINTING) {
+        for (int i=1; i<n; i++) {
+            int candidate=(selected+i)%n;
+            if (spirit_status_fresh(&s_dispatch_status[candidate].status,now) &&
+                spirit_action_for_status(&s_dispatch_status[candidate].status,now)==SPIRIT_IDLE) {
+                selected=candidate; reply=true; break;
+            }
+        }
+    }
+    s_report_machine = selected;
+    app_mqtt_snapshot(selected,&s_work);
+    const char *name = app_mqtt_name(selected);
+    lv_label_set_text_fmt(s_report_name,"%s\n%s",name ? name : app_mqtt_sn(selected),app_spirit_skin_name(app_spirit_skin_for_machine(selected)));
+    spirit_status_t status = spirit_status(&s_work);
+    bool fresh = spirit_status_fresh(&status,now);
+    spirit_action_t action = spirit_action_for_status(&status,now);
+    bool running = fresh && action == SPIRIT_PRINTING && app_telemetry_fresh(s_work.pct_valid,s_work.pct_ms,now);
+    lv_label_set_text_fmt(s_report_value,running ? "%d%%" : "--",s_work.pct);
+    char text[48]; ov_state_text(&s_work,text,sizeof(text));
+    if (running && app_telemetry_fresh(s_work.remain_valid,s_work.remain_ms,now)) snprintf(text,sizeof(text),"剩余 %dh%02dm",s_work.remain_min/60,s_work.remain_min%60);
+    if (reply) {
+        static const char *const lines[SPIRIT_SKIN_COUNT] = {"我这边空闲，陪你等呀。","我这里空闲，一起等它完成。","当前空闲，继续协助观察。","我这边没活，陪你盯会儿。","我这边幕间休息，等它谢幕。","我这边空着，陪你看它忙吧。"};
+        snprintf(text,sizeof(text),"%s",lines[app_spirit_skin_for_machine(selected)]);
+    }
+    if (fresh && action == SPIRIT_PAUSED) snprintf(text,sizeof(text),"嗯？暂停了，请检查。");
+    lv_label_set_text(s_report_line,text);
+    app_spirit_view_context(s_work.model,-1,now);
+    app_spirit_view_update(selected,&status,now);
+    app_spirit_view_set_visible(true);
 }
 
 // 概览页按键:上下=选择,OK=进详情
@@ -1043,14 +1099,15 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         // 进入选中机器的详情:删概览页释放内存,按需建详情页
         s_midx = s_ov_sel;
         s_ov_mode = false;
+        app_spirit_view_destroy();
         if (s_ov_page) { lv_obj_delete(s_ov_page); s_ov_page = NULL; }
         detail_build();
         s_cur = 0;
         s_show_eta = false;
-        s_prev_valid = false;
         show_page(0);
         return;
     }
+
     request_refresh();
 }
 
@@ -1059,10 +1116,48 @@ static void ov_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 // 只显示 show 对应的实体页,其余全部隐藏(NULL = 未建的 AMS 页,跳过)
 static void apply_page_vis(int show)
 {
-    for (int i = 0; i < PAGE_MAX; i++) {
-        if (!s_pages[i]) continue;
-        if (i == show) lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
-        else           lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+    if (show < 0 || show >= PAGE_MAX) return;
+    if (s_built_slot != show) {
+        // Ambient chatter is page-local; an event bubble follows the user.
+        if (s_bubble && !s_bubble_sticky && s_bubble_until_ms) {
+            lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+            s_bubble_until_ms = 0;
+        }
+        detail_free();
+        s_pages[show] = page_new();
+        if (show == 0) page_progress_build(s_pages[show]);
+        else if (show <= 4) page_temp_build(s_pages[show]);
+        else if (show <= 8) page_ams_build(s_pages[show], show - 5);
+        else page_device_build(s_pages[show]);
+        s_built_slot = show;
+    }
+    lv_obj_set_hidden(s_pages[show], false);
+    if (s_bubble) lv_obj_move_foreground(s_bubble);
+    app_spirit_view_set_visible(true);
+
+    // Per-page entry dialogue: bubble text plus the matching role clip. Only on
+    // an actual page entry (refresh_all re-applies the same slot every second),
+    // never while an event bubble is still up.
+    uint64_t now = spirit_now_ms();
+    if (s_active && !s_ov_mode && show != s_hint_slot) {
+        s_hint_slot = show;
+        if (!(s_bubble_sticky && s_bubble_until_ms > now)) {
+            app_mqtt_snapshot(s_midx, &s_work);
+            unsigned skin = (unsigned)app_spirit_skin_for_machine(s_midx);
+            int page = show <= 4 ? 0 : show <= 8 ? 1 : 2;
+            unsigned variant = 0;
+            if (show >= 1 && show <= 9) {
+                // Alternate wording on each entry; never repeat the previous one.
+                variant = esp_random() % 2u;
+                if ((int)variant == s_hint_variant[page]) variant ^= 1u;
+                s_hint_variant[page] = (int)variant;
+            }
+            const char *text = page_hint_text(show, (spirit_skin_id_t)skin, &s_work,
+                                              now, variant);
+            if (text) bubble_show(text, false);
+            if (show >= 1 && show <= 9)
+                app_notify_page_voice(s_midx, skin, (unsigned)page, variant);
+        }
     }
 }
 
@@ -1074,12 +1169,13 @@ static void show_page(int idx)
     // 而实际显示哪几页随 AMS 台数变化,必须经 s_slot 映射,否则 AMS 不足 4 台时
     // 会翻到空 AMS 页,设备页反而永远翻不到。
     int show = (idx >= 0 && idx < s_pages_n && idx < PAGE_MAX) ? s_slot[idx] : 0;
+    s_hint_slot = -1;       // an explicit key press re-arms the page dialogue
     apply_page_vis(show);
     s_cur = idx;
     request_refresh();      // 延到 LVGL 任务里重绘(不在按键回调里干重活)
 }
 
-// 详情页(最多 7 个实体页)按需构建/释放:
+// 详情页(最多7个实体页)按需构建/释放:
 // LVGL 内存池紧张,概览页与详情页对象绝不能共存 —— 切换时一建一删;
 // AMS 页也按需建(2 台 AMS 不建 4 页,空页白吃池内存曾把池压到 98% 导致渲染崩溃)。
 // 新页一律先隐藏:页面背景透明,可见的新页会直接叠画在当前页上
@@ -1098,31 +1194,27 @@ static lv_obj_t *page_new(void)
 }
 
 // 补建前 n 个 AMS 页(已有则跳过);refresh_all 随数据到达逐页补齐
-static void ensure_ams_pages(int n)
-{
-    if (n > 4) n = 4;
-    for (int i = 0; i < n; i++) {
-        if (s_pages[2 + i]) continue;
-        s_pages[2 + i] = page_new();
-        page_ams_build(s_pages[2 + i], i);
-    }
-}
-
 static void detail_build(void)
 {
-    s_pages[0] = page_new();
-    s_pages[1] = page_new();
-    for (int i = 2; i <= 5; i++) s_pages[i] = NULL;   // AMS 页延迟到数据到达再建
-    s_pages[6] = page_new();
-    page_progress_build(s_pages[0]);
-    page_temp_build(s_pages[1]);
-    page_device_build(s_pages[6]);
+    s_built_slot = -1;
+    apply_page_vis(0);
 }
 
 static void detail_free(void)
 {
+    s_built_slot = -1;
+    s_time_hint = NULL;
+    app_spirit_view_destroy();
+    if (s_retry) { lv_timer_delete(s_retry); s_retry = NULL; }
     for (int i = 0; i < PAGE_MAX; i++) {
         if (s_pages[i]) { lv_obj_delete(s_pages[i]); s_pages[i] = NULL; }
+    }
+    // Leaving detail to the overview: hide the screen-level bubble. Page
+    // switches keep it alive so an event is not lost while browsing pages.
+    if (s_ov_mode && s_bubble) {
+        lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+        s_bubble_until_ms = 0;
+        s_bubble_sticky = false;
     }
 }
 
@@ -1130,6 +1222,7 @@ void app_printer_enter(void)
 {
     if (s_scr) return;
     app_notify_init();
+    app_spirit_bindings_poll();
 
     s_scr = lv_obj_create(NULL);
     lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -1139,6 +1232,7 @@ void app_printer_enter(void)
 
     header_build();
     status_bar_build();
+    bubble_build();
 
     // 多机(≥2 台)先建概览页、详情页按需构建;单机只建详情页(与旧版一致)。
     s_ov_page = NULL;
@@ -1156,13 +1250,16 @@ void app_printer_enter(void)
 
     s_cur = 0;
     s_show_eta = false;
-    s_last_state[0] = 0;
-    s_prev_valid = false;    // 重进页面时强制整页重绘
-    s_dirty = true;
+
     s_active = true;
+    s_hint_slot = -1;
+    for (int i = 0; i < 3; i++) s_hint_variant[i] = -1;
+    s_chatter_ms = spirit_now_ms();
+    s_chatter_seen = false;
+    s_last_refresh_ms = s_chatter_ms;
     s_timer = lv_timer_create(tick_1s, 1000, NULL);
     s_fast  = lv_timer_create(tick_fast, 30, NULL);   // 承接按键延后的重绘
-    s_slot[0] = 0; s_slot[1] = 1; s_slot[2] = 6;  // 默认(还没 AMS 数据)
+    s_slot[0] = 0; s_slot[1] = 1; s_slot[2] = 9;  // 默认(还没 AMS 数据)
     s_pages_n = 3;
     s_need_refresh = false;
     s_pk_valid = false;      // 丢弃进入前残留的按键
@@ -1179,6 +1276,7 @@ void app_printer_enter(void)
                  (int)mon.free_size, (int)mon.used_pct);
     }
     refresh_all();
+    app_spirit_view_log_budget("enter");
 }
 
 void app_printer_exit(void)
@@ -1187,6 +1285,11 @@ void app_printer_exit(void)
     s_active = false;
     if (s_timer) { lv_timer_delete(s_timer); s_timer = NULL; }
     if (s_fast)  { lv_timer_delete(s_fast);  s_fast  = NULL; }
+    if (s_retry) { lv_timer_delete(s_retry); s_retry = NULL; }
+    app_spirit_view_destroy();
+    s_bubble = s_bubble_lbl = NULL;
+    s_bubble_until_ms = 0;
+    s_bubble_sticky = false;
     s_need_refresh = false;
     s_pk_valid = false;
     lv_obj_delete(s_scr);
@@ -1220,20 +1323,30 @@ static void key_handle(bsp_btn_t btn, bsp_btn_ev_t ev)
         return;   // 单机时交给上层返回菜单
     }
 
-    if (ev == BSP_BTN_CLICK) {
-        s_dirty = true;
-        if (btn == BSP_BTN_UP) {
-            show_page((s_cur + s_pages_n - 1) % s_pages_n);
-        } else if (btn == BSP_BTN_DOWN) {
-            show_page((s_cur + 1) % s_pages_n);
-        } else if (btn == BSP_BTN_OK) {
-            if (s_cur == 0) {
-                s_show_eta = !s_show_eta;      // 进度页:切换剩余/完成
-            } else {
-                app_mqtt_request_now(s_midx);  // 其他页:只请求状态刷新
-                lv_timer_create(tick_once, 1500, NULL);
+    if (ev != BSP_BTN_CLICK) return;
+    if (btn == BSP_BTN_UP) {
+        show_page((s_cur + s_pages_n - 1) % s_pages_n);
+    } else if (btn == BSP_BTN_DOWN) {
+        show_page((s_cur + 1) % s_pages_n);
+    } else if (btn == BSP_BTN_OK) {
+        if (s_cur == 0) {
+            app_mqtt_snapshot(s_midx, &s_work);
+#define st s_work
+            uint64_t now_ms = spirit_now_ms();
+            spirit_status_t status = spirit_status(&st);
+            if (!spirit_status_fresh(&status, now_ms)) {
+                app_mqtt_request_now(s_midx);
+                schedule_retry();
+            } else if (!app_spirit_view_acknowledge(s_midx, &status, now_ms)) {
+                s_show_eta = !s_show_eta;
             }
+            if (app_spirit_view_finish_acknowledged(s_midx)) app_spirit_finish_remember(s_midx, spirit_task_token(st.task_id), true);
+#undef st
             refresh_all();
+        } else {
+            app_mqtt_request_now(s_midx);
+            refresh_all();
+            schedule_retry();
         }
     }
 }

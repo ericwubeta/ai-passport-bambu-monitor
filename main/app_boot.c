@@ -1,4 +1,4 @@
-// main/app_boot.c —— PrintPet Core 产品名与终端开机动画。
+// main/app_boot.c —— PrintPet Spirit 开机动画:产品名 + 赛博终端启动。
 // 结束后回调交给主流程(打印机状态屏)。
 #include "app_boot.h"
 #include "app_identity.h"

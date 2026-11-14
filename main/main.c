@@ -1,4 +1,4 @@
-// main/main.c —— PrintPet Core 固件入口:开机动画 → 直达打印状态屏。
+// main/main.c —— PrintPet Spirit 固件入口:开机动画 → 直达拓竹状态屏。
 // 裁剪自多合一固件:仅保留打印机监控,长按确定回单页菜单。
 //
 // 按键语义(与主固件一致):
@@ -18,6 +18,9 @@
 #include "app_provision.h"
 #include "app_wifi_menu.h"
 #include "app_printer.h"
+#include "app_spirit_picker.h"
+#include "app_settings.h"
+#include "app_spirit_skins.h"
 #include "app_wifi.h"
 #include "app_mqtt.h"
 #include "font_zh.h"
@@ -27,13 +30,29 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "driver/usb_serial_jtag.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include <stdatomic.h>
 
 static const char *TAG = "main";
+
+typedef struct {
+    bsp_btn_t button;
+    bsp_btn_ev_t event;
+} app_input_t;
+
+static QueueHandle_t s_input_queue;
+static lv_timer_t *s_input_timer;
+static atomic_bool s_input_ready;
 
 // 空闲熄屏:30s 无按键 → 背光 0 并暂停 LVGL;任意键点亮,并吞掉唤醒它的那一次按键。
 static int64_t s_key_us;
 static bool    s_screen_off;
 static bool    s_swallow_key;
+static bool    s_wake_saw_long;
+static bsp_btn_t s_wake_button;
+static int64_t s_wake_guard_until_us;
 static esp_timer_handle_t s_scr_timer;
 
 #if CONFIG_PM_ENABLE
@@ -87,7 +106,8 @@ static void pm_init(void)
 static void screen_off_tick(void *arg)
 {
     (void)arg;
-    if (s_screen_off || app_provision_needed()) return;   // 配网页不熄屏
+    if (!atomic_load_explicit(&s_input_ready, memory_order_acquire) ||
+        s_screen_off || app_provision_needed()) return;   // 启动/输入故障/配网页不熄屏
     if (esp_timer_get_time() - s_key_us < 30LL * 1000 * 1000) return;
     bsp_display_backlight(0);
     // 熄屏后停掉 LVGL 的 5ms tick 与全部 lv_timer,CPU 才有连续空闲进入 light sleep。
@@ -112,7 +132,7 @@ static void screen_off_init(void)
 }
 
 // true = 这次按键只用于唤醒,不再往下处理。
-static bool screen_off_on_key(bsp_btn_ev_t ev)
+static bool screen_off_on_key(bsp_btn_t button, bsp_btn_ev_t ev)
 {
     s_key_us = esp_timer_get_time();
     if (s_screen_off) {
@@ -122,14 +142,23 @@ static bool screen_off_on_key(bsp_btn_ev_t ev)
 #endif
         // 先恢复 LVGL(tick + 定时器,并整屏失效),再开背光,避免亮起一帧陈旧画面。
         bsp_lvgl_set_suspended(false);
-        bsp_display_backlight(100);
+        bsp_display_backlight((uint8_t)app_settings_brightness());
         if (s_scr_timer) esp_timer_start_periodic(s_scr_timer, 1000ULL * 1000);
         ESP_LOGI(TAG, "按键唤醒,亮屏");
-        if (ev != BSP_BTN_RELEASE) s_swallow_key = true;
+        s_wake_button = button;
+        s_wake_saw_long = ev == BSP_BTN_LONG;
+        s_wake_guard_until_us = s_key_us + 2LL * 1000 * 1000;
+        s_swallow_key = ev != BSP_BTN_CLICK && ev != BSP_BTN_DOUBLE;
         return true;
     }
-    if (s_swallow_key) {
-        if (ev == BSP_BTN_RELEASE) s_swallow_key = false;
+    if (s_swallow_key && s_key_us > s_wake_guard_until_us) s_swallow_key = false;
+    if (s_swallow_key && button == s_wake_button) {
+        if (ev == BSP_BTN_LONG) s_wake_saw_long = true;
+        // The button driver emits SINGLE_CLICK after PRESS_UP. A short
+        // release therefore cannot end the wake guard; swallow its terminal
+        // CLICK/DOUBLE too. A long press ends at RELEASE and has no click.
+        if (ev == BSP_BTN_CLICK || ev == BSP_BTN_DOUBLE ||
+            (ev == BSP_BTN_RELEASE && s_wake_saw_long)) s_swallow_key = false;
         return true;
     }
     return false;
@@ -139,6 +168,8 @@ static const demo_entry_t DEMOS[] = {
     { "打印机", app_printer_enter,   app_printer_exit,   app_printer_key },
     { "配网",   app_provision_enter, app_provision_exit, app_provision_key },
     { "切网",   app_wifi_menu_enter, app_wifi_menu_exit, app_wifi_menu_key },
+    { "精灵",   app_spirit_picker_enter, app_spirit_picker_exit, app_spirit_picker_key },
+    { "设置",   app_settings_enter,  app_settings_exit,  app_settings_key },
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
@@ -163,11 +194,11 @@ static void menu_refresh(void) {
 }
 
 static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create(APP_PRODUCT_NAME);
+    s_menu_scr = ui_pixel_screen_create(APP_PRODUCT_FAMILY);
 
     for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int cy = 140 - (int)(DEMO_COUNT - 1) * 35 + (int)i * 70;   // 多项时竖排居中
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, 60, cy, 100, 46, UI_PAPER);
+        int cy = 60 + (int)i * 44;
+        s_cards[i] = ui_pixel_panel_create(s_menu_scr, 60, cy, 120, 40, UI_PAPER);
         s_rows[i] = lv_label_create(s_cards[i]);
         lv_obj_set_style_text_font(s_rows[i], &font_zh14, 0);
         lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
@@ -185,19 +216,16 @@ static void enter_menu(void) {
     menu_build();
 }
 
-// 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
-static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
-    (void)user;
-    if (screen_off_on_key(ev)) return;
-    if (!bsp_lvgl_lock(500)) return;
-
+// All navigation and page construction run in the LVGL task, whose stack also
+// handles boot_done(). The shared esp_timer/button stack cannot hold the full
+// printer snapshot plus nested LVGL/font/printf calls when re-entering a page.
+static void process_input(bsp_btn_t btn, bsp_btn_ev_t ev) {
     if (s_active >= 0) {
         if (btn == BSP_BTN_OK && ev == BSP_BTN_LONG) {     // 统一返回
             // 打印机页多机概览时,长按 OK 先被 app_printer 内部消化
             // (详情→概览);只有已在概览页才真正退出到菜单。
             if (s_active == 0 && app_mqtt_machine_count() >= 2 && !app_printer_in_overview()) {
                 DEMOS[s_active].key(btn, ev);   // 交回打印机页:返回机器列表
-                bsp_lvgl_unlock();
                 return;
             }
             DEMOS[s_active].exit();
@@ -219,7 +247,34 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
             DEMOS[s_active].enter();
         }
     }
-    bsp_lvgl_unlock();
+}
+
+static void input_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!atomic_load_explicit(&s_input_ready, memory_order_acquire)) return;
+    app_input_t input;
+    while (xQueueReceive(s_input_queue, &input, 0) == pdTRUE) {
+        int previous_page = s_active;
+        process_input(input.button, input.event);
+        if (previous_page != s_active) {
+            ESP_LOGI(TAG, "navigation page=%d lvgl_stack_min_free=%uB", s_active,
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        }
+    }
+}
+
+// Button callbacks are dispatched on the shared esp_timer stack. Only the
+// existing lightweight wake/resume path may run here, since suspended LVGL
+// timers cannot wake themselves. Never create/delete pages or format labels.
+static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
+{
+    (void)user;
+    if (!atomic_load_explicit(&s_input_ready, memory_order_acquire)) return;
+    if (screen_off_on_key(btn, ev)) return;
+    if (ev != BSP_BTN_CLICK && ev != BSP_BTN_LONG) return;
+    app_input_t input = {.button = btn, .event = ev};
+    (void)xQueueSend(s_input_queue, &input, 0);
 }
 
 // 开机动画结束回调(此时已持 LVGL 锁):未配网→配网模式;已配置→联网直达打印机屏
@@ -229,16 +284,21 @@ static void boot_done(void) {
         app_provision_start();
         s_active = 1;
         DEMOS[1].enter();
+        atomic_store_explicit(&s_input_ready, s_ok[0], memory_order_release);
         return;
     }
     app_wifi_start();
     app_mqtt_start();
     s_active = 0;
     DEMOS[0].enter();
+    atomic_store_explicit(&s_input_ready, s_ok[0], memory_order_release);
 }
 
 void app_main(void) {
     ESP_LOGI(TAG, APP_PRODUCT_NAME " starting on " APP_HARDWARE_NAME);
+
+    app_spirit_skins_init();
+    app_settings_init();                                    // 读取音量/亮度
 
     bsp_i2c_init();
     bsp_i2c_scan();
@@ -250,13 +310,34 @@ void app_main(void) {
         return;
     }
     pm_init();
-    bsp_display_backlight(100);
+    bsp_display_backlight((uint8_t)app_settings_brightness());
     screen_off_init();
 
-    s_ok[0] = (bsp_button_init(on_key, NULL) == ESP_OK);   // 页面导航依赖按键
+    s_input_queue = xQueueCreate(8, sizeof(app_input_t));
+    if (s_input_queue && bsp_lvgl_lock(1000)) {
+        s_input_timer = lv_timer_create(input_tick, 30, NULL);
+        bsp_lvgl_unlock();
+    }
+    s_ok[0] = s_input_queue && s_input_timer &&
+              (bsp_button_init(on_key, NULL) == ESP_OK);
+    if (!s_ok[0]) {
+        if (s_input_timer && bsp_lvgl_lock(1000)) {
+            lv_timer_delete(s_input_timer);
+            s_input_timer = NULL;
+            bsp_lvgl_unlock();
+        }
+        if (s_input_queue && !s_input_timer) {
+            vQueueDelete(s_input_queue);
+            s_input_queue = NULL;
+        }
+        ESP_LOGE(TAG, "Button dispatch unavailable; monitoring remains visible");
+    }
     s_ok[1] = true;                                        // 配网页常驻可用(修:原来进不去)
     s_ok[2] = true;                                        // 切网页:依赖已保存 WiFi 列表
+    s_ok[3] = s_ok[0];                                     // 精灵选择依赖按键
+    s_ok[4] = s_ok[0];                                     // 设置页依赖按键
     bsp_audio_init();                                       // 提示音(完成/失败/HMS)
+    bsp_audio_set_volume((uint8_t)app_settings_volume());   // 菜单里设置的音量
     bsp_battery_init();                                     // 状态栏电量
 
     // 开机动画(拓竹 logo)→ 直接进打印机监控页

@@ -26,6 +26,11 @@ CONFIG_LV_COLOR_DEPTH_16=y
 # CONFIG_LV_USE_ASSERT_MALLOC is not set
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+# Indexed alternative skins decode one scanline, without full-image RAM loading.
+# CONFIG_LV_BIN_DECODER_RAM_LOAD is not set
+CONFIG_LV_CACHE_DEF_SIZE=0
+CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=0
 # LVGL 内置 malloc 池大小(字节)。独立静态区,配太大会挤占系统 RAM 影响 TLS/MQTT。
 # 48KB 时 UI 对象(~43KB)+渲染耗尽导致 SW 渲染卡死;72KB 时 TLS 握手堆不足连不上云。
 # 拓竹云端 pushall 回报单条 TLS record 约 11.7KB,需要一次性连续 11.7KB:

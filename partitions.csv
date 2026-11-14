@@ -1,7 +1,7 @@
-# Name,   Type, SubType, Offset,  Size,    Flags
-# 8MB Flash:WiFi+TLS+MQTT 后固件约 1.6MB,默认单 APP 表(1MB)装不下,
-# factory 放大到 4M,余量留给 Phase 2(中文字体/HMS 码表等)。
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 4M,
-spiffs,   data, spiffs,  0x410000, 0x3F0000,
+# PrintPet shared 8MiB layout. Never fill/erase the vendor identity gap.
+# Name, Type, SubType, Offset, Size, Flags
+nvs,data,nvs,0x9000,0x6000,
+phy_init,data,phy,0xf000,0x1000,
+spiffs,data,spiffs,0x10000,0x300000,
+cardid,data,nvs,0x356000,0x4000,readonly
+factory,app,factory,0x370000,0x400000,

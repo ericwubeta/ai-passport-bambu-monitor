@@ -1,4 +1,4 @@
-// main/app_printer.h —— 多机概览与只读详情页（进度/温度/AMS/设备），上下键切换。
+// main/app_printer.h —— 打印机状态主界面:多机概览 + 5 个详情页,上下键切换,30 秒自动刷新。
 #pragma once
 
 #include <stdbool.h>
