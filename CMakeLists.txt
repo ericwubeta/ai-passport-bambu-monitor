@@ -8,4 +8,4 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # v1.5: 省电(空闲熄屏 + Wi-Fi modem sleep + 音频按需 + 自动 light sleep)+ 云端大报文本地修复
 # 产物名 passport_printer.bin
 # v1.5.1: Core read-only cleanup; historical v1.5.0 tag remains unchanged.
-project(passport_printer VERSION 1.5.1)
+project(passport_printer VERSION 1.5.2)
