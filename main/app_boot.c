@@ -1,13 +1,13 @@
-// main/app_boot.c —— 开机动画:拓竹 logo + 赛博终端启动(逐字 boot 日志 + exec 高亮 + 霓虹加载条)
+// main/app_boot.c —— PrintPet Core 产品名与终端开机动画。
 // 结束后回调交给主流程(打印机状态屏)。
 #include "app_boot.h"
+#include "app_identity.h"
 
 #include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "font_zh.h"
-#include "logo_bambu.h"
 #include "lvgl.h"
 
 #define BG      0x04070A
@@ -150,10 +150,11 @@ void app_boot_show(void (*done)(void))
     lv_obj_set_style_border_width(s_ctx.scr, 0, 0);
     lv_obj_set_style_pad_all(s_ctx.scr, 0, 0);
 
-    // 拓竹 logo(240x87 深色底位图)
-    lv_obj_t *logo = lv_image_create(s_ctx.scr);
-    lv_image_set_src(logo, &logo_bambu_img);
-    lv_obj_align(logo, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_t *brand = lv_label_create(s_ctx.scr);
+    lv_obj_set_style_text_font(brand, &font_zh20, 0);
+    lv_obj_set_style_text_color(brand, lv_color_hex(NEON), 0);
+    lv_label_set_text(brand, APP_PRODUCT_NAME);
+    lv_obj_align(brand, LV_ALIGN_TOP_MID, 0, 60);
 
     // 终端面板
     lv_obj_t *panel = lv_obj_create(s_ctx.scr);
@@ -174,7 +175,7 @@ void app_boot_show(void (*done)(void))
     lv_obj_t *hb = lv_label_create(panel);
     lv_obj_set_style_text_font(hb, LV_FONT_DEFAULT, 0);
     lv_obj_set_style_text_color(hb, lv_color_hex(DIM), 0);
-    lv_label_set_text(hb, "BAMBU MONITOR // BOOT");
+    lv_label_set_text(hb, "PRINTPET // BOOT");
     lv_obj_align(hb, LV_ALIGN_TOP_LEFT, 8, 6);
 
     // 内容区(flex 纵向,自动堆叠)

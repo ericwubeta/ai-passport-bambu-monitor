@@ -56,7 +56,7 @@ delayed updates, clock reset and the exact five-second Loading boundary.
 Navigation tests compile actual page switching with an allocator budget that
 allows one visible detail page while the cancelled camera still owns its buffer.
 They cycle all pages and four AMS slots, verify stop-before-delete, retain widgets
-on repeated refresh and cancel control confirmation on leaving its page. MQTT
+on repeated refresh and reject the retired control page slot. MQTT
 client-ID cases distinguish two device MACs with the same nonce, another boot,
 and the fallback when MAC reading fails.
 

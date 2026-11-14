@@ -1,4 +1,4 @@
-// main/app_boot.h —— 拓竹 logo 开机动画(logo 淡入 + 加载条,约 1.6 秒)。
+// main/app_boot.h —— PrintPet Core 产品名与终端开机动画。
 #pragma once
 
 // 显示开机画面,动画结束后在 LVGL 上下文里回调 done(此时已持锁)。

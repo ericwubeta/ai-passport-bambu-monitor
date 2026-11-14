@@ -1,5 +1,4 @@
-// Printer overview and detail pages: progress, camera, temperature, AMS, device,
-// controls. Camera is always the second detail page; up/down navigate.
+// Read-only printer overview and detail pages. Camera is the second detail page.
 #pragma once
 
 #include <stdbool.h>

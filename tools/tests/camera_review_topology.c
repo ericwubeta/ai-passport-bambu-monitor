@@ -21,9 +21,8 @@ void app_notify_trigger(notify_kind_t kind) {}
 /* @MQTT@ */
 #define PAGE_MAX 9
 #define CAMERA_SLOT 8
-static bool s_ov_mode, s_prev_valid, s_dirty, s_stop_armed;
+static bool s_ov_mode, s_prev_valid, s_dirty;
 static int s_midx, s_cur, s_restore_slot, s_pages_n, s_slot[PAGE_MAX];
-static int64_t s_stop_armed_at;
 static int remembered_slot, remember_calls;
 void app_mqtt_snapshot(int machine, bambu_state_t *out) { *out = s_state[machine]; }
 static void remember_view(void) { remember_calls++; remembered_slot = s_slot[s_cur]; }
@@ -37,7 +36,6 @@ static void remember_view(void) { remember_calls++; remembered_slot = s_slot[s_c
 #define refresh_temp(...) ((void)0)
 #define refresh_ams(...) ((void)0)
 #define refresh_device(...) ((void)0)
-#define ctl_refresh_items(...) ((void)0)
 /* @REFRESH@ */
 static void report(int machine, const char *json) { parse_report(machine,json,(int)strlen(json)); }
 int main(int argc, char **argv) {
@@ -57,7 +55,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     s_restore_slot = remembered_slot = 5; // AMS4 physical slot, not navigation index.
-    s_slot[0]=0; s_slot[1]=8; s_slot[2]=1; s_slot[3]=6; s_slot[4]=7; s_pages_n=5;
+    s_slot[0]=0; s_slot[1]=8; s_slot[2]=1; s_slot[3]=6; s_pages_n=4;
     refresh_all();
     assert(s_restore_slot == 5 && s_slot[s_cur] == 5 && remember_calls == 0);
     report(0,"{\"print\":{\"gcode_state\":\"RUNNING\",\"mc_percent\":99}}");

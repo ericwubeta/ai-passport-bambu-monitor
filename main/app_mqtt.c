@@ -6,6 +6,7 @@
 // username = u_<USER_ID>,password = accessToken,client_id 随机 bbl_xxx。
 #include "app_mqtt.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -662,6 +663,7 @@ static void parse_report(int idx, const char *data, int len)
 
 // ---------------------------------------------------------------- 事件
 
+// 只读刷新：请求打印机状态快照。
 static void push_pushall(int idx)
 {
     if (!s_cli || idx < 0 || idx >= s_mcount) return;
@@ -820,39 +822,6 @@ void app_mqtt_stop(void)
 void app_mqtt_request_now(int idx)
 {
     push_pushall(idx);
-}
-
-// 发布到 device/<sn>/request。拓竹 OpenBambuAPI 命令格式:
-//   打印控制 {"print":{"sequence_id":"<n>","command":"pause|resume|stop","param":""}}(QoS 1)
-//   腔灯     {"system":{"sequence_id":"<n>","command":"ledctrl","led_node":"chamber_light","led_mode":"on|off"}}
-static void publish_request(int idx, const char *payload, int qos)
-{
-    if (!s_cli) { ESP_LOGW(TAG, "MQTT 未连接,命令丢弃"); return; }
-    if (idx < 0 || idx >= s_mcount) { ESP_LOGW(TAG, "机器下标无效,命令丢弃"); return; }
-    char topic[48];
-    snprintf(topic, sizeof(topic), "device/%s/request", sn_at(idx));
-    int id = esp_mqtt_client_publish(s_cli, topic, payload, 0, qos, 0);
-    ESP_LOGI(TAG, "发布 %s -> %s(%s)", payload, topic, id < 0 ? "失败" : "成功");
-}
-
-void app_mqtt_print_command(int idx, const char *cmd)
-{
-    if (!cmd || (strcmp(cmd, "pause") && strcmp(cmd, "resume") && strcmp(cmd, "stop"))) return;
-    char payload[160];
-    snprintf(payload, sizeof(payload),
-             "{\"print\":{\"sequence_id\":\"%u\",\"command\":\"%s\",\"param\":\"\"}}",
-             (unsigned)esp_random(), cmd);
-    publish_request(idx, payload, 1);
-}
-
-void app_mqtt_set_chamber_light(int idx, bool on)
-{
-    char payload[192];
-    snprintf(payload, sizeof(payload),
-             "{\"system\":{\"sequence_id\":\"%u\",\"command\":\"ledctrl\","
-             "\"led_node\":\"chamber_light\",\"led_mode\":\"%s\"}}",
-             (unsigned)esp_random(), on ? "on" : "off");
-    publish_request(idx, payload, 0);
 }
 
 uint32_t app_mqtt_screen_wake_sequence(void)

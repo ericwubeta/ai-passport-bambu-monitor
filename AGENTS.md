@@ -1,39 +1,9 @@
-# Repository Guidelines
+# PrintPet firmware maintenance
 
-## Project Structure & Module Organization
+Preserve historical tags and all unrelated local changes. Core1.5.2 and Spirit2.0.1 are separate product choices; neither controls printers. Build and host checks are separate from physical device acceptance.
 
-This repository is an ESP-IDF BSP and hardware demonstration for the ESP32-C3-based FoloToy AI Passport.
+This source uses a shared ESP32-C3 8MiB layout: app0x370000/4MiB, resources0x10000/3MiB, read-only cardid0x356000/0x4000. Never erase or write the vendor gap0x310000–0x36FFFF or copy another device identity. Only complete sparse packages may be offered for installation/recovery; follow docs/INSTALL.md. Building/publication does not authorize device access or flashing.
 
-- `components/bsp/include/`: public BSP APIs and the hardware pin/configuration source of truth (`bsp_pins.h`).
-- `components/bsp/src/`: display, button, audio, battery, and shared-I2C implementations.
-- `main/`: the LVGL menu and independent `demo_*.c` hardware validation pages. New demos should implement the `enter`, `exit`, and `key` interface declared in `demo.h`.
-- `sdkconfig.defaults`: reproducible target, console, LVGL, and memory defaults.
-- `README.md`: wiring, known hardware traps, and the required on-device acceptance checklist.
+Never commit secrets.h, credentials, personal NVS/Flash backups or raw device logs. Use placeholder secrets for release builds. Reuse BSP drivers, preserve LVGL locking and nonblocking button callbacks, and verify Chinese glyph coverage. Keep software/toolchains/build outputs on E: on the original workstation.
 
-Keep reusable hardware logic in `components/bsp`; keep board demonstration and UI behavior in `main`.
-
-## Build, Test, and Development Commands
-
-Use ESP-IDF 5.5.x:
-
-```bash
-get_idf553                    # Enter the repository's ESP-IDF 5.5.3 environment
-idf.py set-target esp32c3     # Configure a fresh checkout
-idf.py build                  # Compile firmware and validate dependencies
-idf.py flash monitor          # Flash the connected board and open logs
-idf.py fullclean              # Remove generated build state when configuration is stale
-```
-
-Run `python -m unittest discover -s tools -p 'test_*.py' -v` for host protocol and camera regressions. The firmware-function regressions require a native C compiler (`CC=cc` or `CC="zig cc"`); a skipped compiler-dependent suite does not count as a pass. See `tools/tests/README.md` for scope. Treat a clean `idf.py build` as the minimum firmware check, then run every applicable item in the README acceptance checklist on real hardware.
-
-## Coding Style & Naming Conventions
-
-Write C using four-space indentation and K&R-style braces, following nearby files. Use `snake_case` for functions and locals, `BSP_*` for public hardware constants, and `s_` for file-local state. Keep BSP APIs prefixed with `bsp_`; name demo entry points `demo_<feature>_<action>`. Prefer `static` for internal symbols. Hardware-demo UI text stays English. Printer-monitor pages, including the camera page, retain the existing Chinese labels for a consistent interface; camera connection/configuration prompts may stay English. This monitor-specific language choice was explicitly confirmed by the user. Explanatory comments may be Chinese. Preserve comments documenting hardware-specific register values and memory constraints.
-
-## Testing Guidelines
-
-Before submitting, build from the repository root and inspect warnings. On hardware, verify menu navigation and the affected Display, Button, Audio, or Battery page. For pin, display-rotation, codec-clock, ADC, or DMA changes, explicitly record the observed hardware result in the PR. Do not increase LVGL buffers or audio allocations without checking ESP32-C3 internal RAM usage; the board has no PSRAM.
-
-## Commit & Pull Request Guidelines
-
-History follows Conventional Commit-style subjects such as `feat(bsp): ...`, `feat(demo): ...`, `fix(bsp): ...`, and `docs: ...`. Keep commits focused by subsystem. Pull requests should explain the hardware/revision tested, summarize behavior changes, list build and on-device results, and include photos or screenshots for display changes. Link related issues and call out wiring, pin-map, or compatibility impacts.
+Keep hardware-demo UI in English. Keep the printer-monitor labels in Chinese, including on the camera page. Camera connection and configuration prompts may be in English. Run the read-only host tests in tests/host and the camera and screen regressions in tools/tests when changing shared monitoring behavior.

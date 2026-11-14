@@ -7,6 +7,7 @@
 //   3) 自动取得 accessToken / User ID / 打印机 SN → 写 NVS → 重启
 // 高级选项里仍保留手动填 Token/序列号(老用户或接口变动时兜底)。
 #include "app_provision.h"
+#include "app_identity.h"
 
 #include <stdio.h>
 #include <stdlib.h>      // atoi(delwifi 的槽位下标)
@@ -56,7 +57,7 @@ static const char *TAG = "provision";
 static const char *PAGE_HTML =
 "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>拓竹监视器 配网</title><style>"
+"<title>" APP_PRODUCT_NAME " 配网</title><style>"
 "body{font-family:system-ui,sans-serif;background:#0b0f16;color:#e6edf3;"
 "max-width:420px;margin:0 auto;padding:20px}"
 "h2{color:#34d97b;font-size:20px;margin:8px 0}"
@@ -83,7 +84,7 @@ static const char *PAGE_HTML =
 "details{margin-top:22px;border-top:1px solid #1e2a38;padding-top:12px}"
 "summary{font-size:13px;color:#6b7a8c;cursor:pointer}"
 "</style></head><body>"
-"<h2>拓竹监视器 · 配网</h2>"
+"<h2>" APP_PRODUCT_NAME " · 配网</h2>"
 "<p>全程手机完成，不需要电脑。</p>"
 "<h3>1. 连接 WiFi（设备要上网才能登录拓竹）</h3>"
 "<button onclick='doScan()'>扫描附近 WiFi</button><div id='aps'></div>"

@@ -1,6 +1,6 @@
 # AI Passport 相机刷新与 FPS
 
-日期：2026-11-10。目标为 ESP32-C3 AI Passport，8 MB Flash、无 PSRAM，ESP-IDF 5.5.3 / LVGL 9.5.0。实测打印机为 X2D，局域网 TLS/6000 JPEG 源图 1920×1080，显示区 240×135。其他源尺寸仍动态计算，不固定机型。
+日期：2026-11-10。目标为 ESP32-C3 AI Passport，8 MB Flash、无 PSRAM，ESP-IDF 5.5.3 / LVGL 9.5.0。以下实机数据采自旧分区布局。实测打印机为 X2D，局域网 TLS/6000 JPEG 源图 1920×1080，显示区 240×135。其他源尺寸仍动态计算，不固定机型。
 
 ## 同步内容
 

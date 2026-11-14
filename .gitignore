@@ -1,4 +1,5 @@
 build/
+build-host/
 sdkconfig
 sdkconfig.old
 managed_components/
@@ -23,3 +24,7 @@ bambumonitor.bin
 build_log.txt
 __pycache__/
 *.pyc
+
+**/private-backups/
+**/*-serial.raw.log
+**/full-before.bin

@@ -1,8 +1,8 @@
-// main/main.c —— AI Passport 独立打印机固件入口:开机动画 → 直达拓竹状态屏。
+// main/main.c —— PrintPet Core 固件入口:开机动画 → 直达打印状态屏。
 // 裁剪自多合一固件:仅保留打印机监控,长按确定回单页菜单。
 //
 // 按键语义(与主固件一致):
-//   上/下 短按   打印机页=切换页面(状态/温度/AMS/设备/控制)
+//   上/下 短按   打印机页=切换只读页面(进度/相机/温度/AMS/设备)
 //   确定  短按   打印机页=立即刷新
 //   确定  长按   返回菜单(单页,再按确定回到打印机页)
 #include "bsp_i2c.h"
@@ -14,6 +14,7 @@
 #include "demo.h"
 #include "ui_pixel.h"
 #include "app_boot.h"
+#include "app_identity.h"
 #include "app_provision.h"
 #include "app_wifi_menu.h"
 #include "app_printer.h"
@@ -222,7 +223,7 @@ static void menu_refresh(void) {
 }
 
 static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("AI 通行证");
+    s_menu_scr = ui_pixel_screen_create(APP_PRODUCT_NAME);
 
     for (size_t i = 0; i < DEMO_COUNT; i++) {
         int cy = 140 - (int)(DEMO_COUNT - 1) * 35 + (int)i * 70;   // 多项时竖排居中
@@ -313,7 +314,7 @@ void app_main(void) {
     extern void camera_geometry_selftest(void);
     camera_geometry_selftest();
 #endif
-    ESP_LOGI(TAG, "AI Passport 打印机固件启动");
+    ESP_LOGI(TAG, APP_PRODUCT_NAME " starting on " APP_HARDWARE_NAME);
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "Boot wake=%s", wake_cause == ESP_SLEEP_WAKEUP_GPIO ? "button" :
              wake_cause == ESP_SLEEP_WAKEUP_TIMER ? "timer" : "reset");
